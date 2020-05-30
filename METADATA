@@ -1,0 +1,17 @@
+name: "dwarves"
+description:
+    "Pahole and other DWARF utils"
+
+third_party {
+  url {
+    type: HOMEPAGE
+    value: "https://git.kernel.org/pub/scm/devel/pahole/pahole.git/"
+  }
+  url {
+    type: GIT
+    value: "https://git.kernel.org/pub/scm/devel/pahole/pahole"
+  }
+  version: "v1.17"
+  last_upgrade_date { year: 2020 month: 5 day: 30 }
+  license_type: RESTRICTED
+}
