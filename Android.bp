@@ -15,7 +15,8 @@
 cc_defaults {
     name: "dwarves_defaults",
     cflags: [
-        "-DDWARVES_VERSION=\"v1.17\"",
+        "-DDWARVES_MAJOR_VERSION=1",
+        "-DDWARVES_MINOR_VERSION=19",
         "-D_GNU_SOURCE",
         "-Wno-pointer-arith",
         "-Wno-unused-parameter",

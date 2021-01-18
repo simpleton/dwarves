@@ -23,10 +23,14 @@
 #include "list.h"
 #include "dwarves.h"
 #include "dutil.h"
-#include "strings.h"
+#include "pahole_strings.h"
 #include "hash.h"
 
 struct strings *strings;
+
+#ifndef DW_AT_alignment
+#define DW_AT_alignment 0x88
+#endif
 
 #ifndef DW_AT_GNU_vector
 #define DW_AT_GNU_vector 0x2107
@@ -89,7 +93,7 @@ static void dwarf_tag__set_spec(struct dwarf_tag *dtag, dwarf_off_ref spec)
 	*(dwarf_off_ref *)(dtag + 1) = spec;
 }
 
-#define HASHTAGS__BITS 8
+#define HASHTAGS__BITS 15
 #define HASHTAGS__SIZE (1UL << HASHTAGS__BITS)
 
 #define obstack_chunk_alloc malloc
@@ -590,7 +594,15 @@ const char *variable__scope_str(const struct variable *var)
 
 static struct variable *variable__new(Dwarf_Die *die, struct cu *cu)
 {
-	struct variable *var = tag__alloc(cu, sizeof(*var));
+	struct variable *var;
+	bool has_specification;
+
+	has_specification = dwarf_hasattr(die, DW_AT_specification);
+	if (has_specification) {
+		var = tag__alloc_with_spec(cu, sizeof(*var));
+	} else {
+		var = tag__alloc(cu, sizeof(*var));
+	}
 
 	if (var != NULL) {
 		tag__init(&var->ip.tag, cu, die);
@@ -603,6 +615,10 @@ static struct variable *variable__new(Dwarf_Die *die, struct cu *cu)
 		var->ip.addr = 0;
 		if (!var->declaration && cu->has_addr_info)
 			var->scope = dwarf__location(die, &var->ip.addr, &var->location);
+		if (has_specification) {
+			dwarf_tag__set_spec(var->ip.tag.priv,
+					    attr_type(die, DW_AT_specification));
+		}
 	}
 
 	return var;
@@ -1726,7 +1742,10 @@ static int die__process_unit(Dwarf_Die *die, struct cu *cu)
 			return -ENOMEM;
 
 		if (tag == &unsupported_tag) {
-			tag__print_not_supported(dwarf_tag(die));
+			// XXX special case DW_TAG_dwarf_procedure, appears when looking at a recent ~/bin/perf
+			// Investigate later how to properly support this...
+			if (dwarf_tag(die) != DW_TAG_dwarf_procedure)
+				tag__print_not_supported(dwarf_tag(die));
 			continue;
 		}
 
@@ -2062,6 +2081,17 @@ static int tag__recode_dwarf_type(struct tag *tag, struct cu *cu)
 		if (dtype != NULL)
 			goto out;
 		goto find_type;
+	case DW_TAG_variable: {
+		struct variable *var = tag__variable(tag);
+		dwarf_off_ref specification = dwarf_tag__spec(dtag);
+
+		if (specification.off) {
+			dtype = dwarf_cu__find_tag_by_ref(cu->priv, &specification);
+			if (dtype)
+				var->spec = tag__variable(dtype->tag);
+		}
+	}
+
 	}
 
 	if (dtag->type.off == 0) {
@@ -2129,7 +2159,7 @@ static unsigned long long dwarf_tag__orig_id(const struct tag *tag,
 static const char *dwarf__strings_ptr(const struct cu *cu __unused,
 				      strings_t s)
 {
-	return strings__ptr(strings, s);
+	return s ? strings__ptr(strings, s) : NULL;
 }
 
 struct debug_fmt_ops dwarf__ops;
@@ -2145,7 +2175,7 @@ static int die__process(Dwarf_Die *die, struct cu *cu)
 		if (!warned) {
 			fprintf(stderr, "WARNING: DW_TAG_partial_unit used, some types will not be considered!\n"
 					"         Probably this was optimized using a tool like 'dwz'\n"
-					"         A future version of pahole will take support this.\n");
+					"         A future version of pahole will support this.\n");
 			warned = true;
 		}
 		return 0; // so that other units can be processed
