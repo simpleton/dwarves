@@ -10,6 +10,7 @@
  */
 
 #include <stdbool.h>
+#include <linux/stddef.h>
 #include <stddef.h>
 #include <string.h>
 #include <elf.h>
@@ -20,8 +21,8 @@
 
 #define BITS_PER_LONG __BITS_PER_LONG
 
-#ifndef __unused
-#define __unused __attribute__ ((unused))
+#ifndef __maybe_unused
+#define __maybe_unused __attribute__((__unused__))
 #endif
 
 #ifndef __pure
@@ -29,6 +30,10 @@
 #endif
 
 #define roundup(x,y) ((((x) + ((y) - 1)) / (y)) * (y))
+
+#ifndef DW_TAG_LLVM_annotation
+#define DW_TAG_LLVM_annotation 0x6000
+#endif
 
 static inline __attribute__((const)) bool is_power_of_2(unsigned long n)
 {
@@ -321,8 +326,7 @@ static inline bool strstarts(const char *str, const char *prefix)
 
 void *zalloc(const size_t size);
 
-Elf_Scn *elf_section_by_name(Elf *elf, GElf_Ehdr *ep,
-			     GElf_Shdr *shp, const char *name, size_t *index);
+Elf_Scn *elf_section_by_name(Elf *elf, GElf_Shdr *shp, const char *name, size_t *index);
 
 Elf_Scn *elf_section_by_idx(Elf *elf, GElf_Shdr *shp, int idx);
 
@@ -335,5 +339,9 @@ static inline int elf_getshdrstrndx(Elf *elf, size_t *dst)
 #endif
 
 char *strlwr(char *s);
+
+void __zfree(void **ptr);
+
+#define zfree(ptr) __zfree((void **)(ptr))
 
 #endif /* _DUTIL_H_ */

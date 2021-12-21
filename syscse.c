@@ -18,10 +18,10 @@
 static const char *prefix = "sys_";
 static size_t prefix_len = 4;
 
-static bool filter(struct function *f, struct cu *cu)
+static bool filter(struct function *f)
 {
 	if (f->proto.nr_parms != 0) {
-		const char *name = function__name(f, cu);
+		const char *name = function__name(f);
 
 		if (strlen(name) > prefix_len &&
 		    memcmp(name, prefix, prefix_len) == 0)
@@ -30,8 +30,7 @@ static bool filter(struct function *f, struct cu *cu)
 	return true;
 }
 
-static void zero_extend(const int regparm, const struct base_type *bt,
-			struct cu *cu, const char *parm)
+static void zero_extend(const int regparm, const struct base_type *bt, const char *parm)
 {
 	const char *instr = "INVALID";
 
@@ -51,14 +50,14 @@ static void zero_extend(const int regparm, const struct base_type *bt,
 	printf("\t%s\t$a%d, $a%d, 0"
 	       "\t/* zero extend $a%d(%s %s) from %d to 64-bit */\n",
 	       instr, regparm, regparm, regparm,
-	       base_type__name(bt, cu, bf, sizeof(bf)),
+	       base_type__name(bt, bf, sizeof(bf)),
 	       parm, bt->bit_size);
 }
 
 static void emit_wrapper(struct function *f, struct cu *cu)
 {
 	struct parameter *parm;
-	const char *name = function__name(f, cu);
+	const char *name = function__name(f);
 	int regparm = 0, needs_wrapper = 0;
 
 	function__for_each_parameter(f, cu, parm) {
@@ -71,14 +70,12 @@ static void emit_wrapper(struct function *f, struct cu *cu)
 			char bf[64];
 
 			if (bt->bit_size < 64 &&
-			    strncmp(base_type__name(bt, cu, bf, sizeof(bf)),
-						    "unsigned", 8) == 0) {
+			    strncmp(base_type__name(bt, bf, sizeof(bf)), "unsigned", 8) == 0) {
 				if (!needs_wrapper) {
 					printf("wrap_%s:\n", name);
 					needs_wrapper = 1;
 				}
-				zero_extend(regparm, bt, cu,
-					    parameter__name(parm, cu));
+				zero_extend(regparm, bt, parameter__name(parm));
 			}
 		}
 		++regparm;
@@ -88,13 +85,13 @@ static void emit_wrapper(struct function *f, struct cu *cu)
 		printf("\tj\t%s\n\n", name);
 }
 
-static int cu__emit_wrapper(struct cu *cu, void *cookie __unused)
+static int cu__emit_wrapper(struct cu *cu, void *cookie __maybe_unused)
 {
 	struct function *pos;
 	uint32_t id;
 
 	cu__for_each_function(cu, id, pos)
-		if (!filter(pos, cu))
+		if (!filter(pos))
 			emit_wrapper(pos, cu);
 	return 0;
 }

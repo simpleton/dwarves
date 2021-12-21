@@ -7,26 +7,18 @@
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <malloc.h>
 
 #include "dwarves.h"
 #include "dutil.h"
 
-static void print_malloc_stats(void)
-{
-	struct mallinfo m = mallinfo();
-
-	fprintf(stderr, "size: %u\n", m.uordblks);
-}
-
-static int class__tag_name(struct tag *tag, struct cu *cu __unused,
-			   void *cookie __unused)
+static int class__tag_name(struct tag *tag, struct cu *cu __maybe_unused,
+			   void *cookie __maybe_unused)
 {
 	puts(dwarf_tag_name(tag->tag));
 	return 0;
 }
 
-static int cu__dump_class_tag_names(struct cu *cu, void *cookie __unused)
+static int cu__dump_class_tag_names(struct cu *cu, void *cookie __maybe_unused)
 {
 	cu__for_all_tags(cu, class__tag_name, NULL);
 	return 0;
@@ -37,15 +29,16 @@ static void cus__dump_class_tag_names(struct cus *cus)
 	cus__for_each_cu(cus, cu__dump_class_tag_names, NULL, NULL);
 }
 
-int main(int argc __unused, char *argv[])
+int main(int argc __maybe_unused, char *argv[])
 {
 	int err, rc = EXIT_FAILURE;
 	struct cus *cus = cus__new();
 
-	if (dwarves__init(0) || cus == NULL) {
+	if (dwarves__init() || cus == NULL) {
 		fputs("dtagnames: insufficient memory\n", stderr);
 		goto out;
 	}
+	dwarves__resolve_cacheline_size(NULL, 0);
 
 	err = cus__load_files(cus, NULL, argv + 1);
 	if (err != 0) {
@@ -54,7 +47,6 @@ int main(int argc __unused, char *argv[])
 	}
 
 	cus__dump_class_tag_names(cus);
-	print_malloc_stats();
 	rc = EXIT_SUCCESS;
 out:
 	cus__delete(cus);

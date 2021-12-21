@@ -18,7 +18,6 @@
 #include "dutil.h"
 #include "list.h"
 #include "rbtree.h"
-#include "pahole_strings.h"
 
 struct cu;
 
@@ -34,22 +33,42 @@ enum load_steal_kind {
  */
 typedef uint32_t type_id_t;
 
+struct btf;
 struct conf_fprintf;
 
 /** struct conf_load - load configuration
+ * @thread_exit - called at the end of a thread, 1st user: BTF encoder dedup
  * @extra_dbg_info - keep original debugging format extra info
  *		     (e.g. DWARF's decl_{line,file}, id, etc)
  * @fixup_silly_bitfields - Fixup silly things such as "int foo:32;"
  * @get_addr_info - wheter to load DW_AT_location and other addr info
+ * @nr_jobs - -j argument, number of threads to use
+ * @ptr_table_stats - print developer oriented ptr_table statistics.
+ * @skip_missing - skip missing types rather than bailing out.
  */
 struct conf_load {
 	enum load_steal_kind	(*steal)(struct cu *cu,
 					 struct conf_load *conf);
+	int			(*thread_exit)(void);
 	void			*cookie;
 	char			*format_path;
+	int			nr_jobs;
 	bool			extra_dbg_info;
+	bool			use_obstack;
 	bool			fixup_silly_bitfields;
 	bool			get_addr_info;
+	bool			ignore_alignment_attr;
+	bool			ignore_inline_expansions;
+	bool			ignore_labels;
+	bool			ptr_table_stats;
+	bool			skip_encoding_btf_decl_tag;
+	bool			skip_missing;
+	bool			skip_encoding_btf_type_tag;
+	uint8_t			hashtable_bits;
+	uint8_t			max_hashtable_bits;
+	uint16_t		kabi_prefix_len;
+	const char		*kabi_prefix;
+	struct btf		*base_btf;
 	struct conf_fprintf	*conf_fprintf;
 };
 
@@ -82,6 +101,7 @@ struct conf_fprintf {
 	const char *header_type;
 	const char *range;
 	uint32_t   skip;
+	uint16_t   cacheline_size;
 	uint8_t	   indent;
 	uint8_t	   expand_types:1;
 	uint8_t	   expand_pointers:1;
@@ -107,10 +127,7 @@ struct conf_fprintf {
 	uint8_t	   strip_inline:1;
 };
 
-struct cus {
-	uint32_t	      nr_entries;
-	struct list_head      cus;
-};
+struct cus;
 
 struct cus *cus__new(void);
 void cus__delete(struct cus *cus);
@@ -127,20 +144,30 @@ int cus__load_dir(struct cus *cus, struct conf_load *conf,
 void cus__add(struct cus *cus, struct cu *cu);
 void cus__print_error_msg(const char *progname, const struct cus *cus,
 			  const char *filename, const int err);
-struct cu *cus__find_cu_by_name(const struct cus *cus, const char *name);
-struct tag *cus__find_struct_by_name(const struct cus *cus, struct cu **cu,
+struct cu *cus__find_pair(struct cus *cus, const char *name);
+struct cu *cus__find_cu_by_name(struct cus *cus, const char *name);
+struct tag *cus__find_struct_by_name(struct cus *cus, struct cu **cu,
 				     const char *name, const int include_decls,
 				     type_id_t *id);
-struct tag *cus__find_struct_or_union_by_name(const struct cus *cus, struct cu **cu,
+struct tag *cus__find_struct_or_union_by_name(struct cus *cus, struct cu **cu,
 					      const char *name, const int include_decls, type_id_t *id);
 struct tag *cu__find_type_by_name(const struct cu *cu, const char *name, const int include_decls, type_id_t *idp);
-struct tag *cus__find_type_by_name(const struct cus *cus, struct cu **cu, const char *name,
+struct tag *cus__find_type_by_name(struct cus *cus, struct cu **cu, const char *name,
 				   const int include_decls, type_id_t *id);
-struct function *cus__find_function_at_addr(const struct cus *cus,
-					    uint64_t addr, struct cu **cu);
+struct function *cus__find_function_at_addr(struct cus *cus, uint64_t addr, struct cu **cu);
 void cus__for_each_cu(struct cus *cus, int (*iterator)(struct cu *cu, void *cookie),
 		      void *cookie,
 		      struct cu *(*filter)(struct cu *cu));
+bool cus__empty(const struct cus *cus);
+uint32_t cus__nr_entries(const struct cus *cus);
+
+void cus__lock(struct cus *cus);
+void cus__unlock(struct cus *cus);
+
+void *cus__priv(struct cus *cus);
+void cus__set_priv(struct cus *cus, void *priv);
+
+void cus__set_loader_exit(struct cus *cus, void (*loader_exit)(struct cus *cus));
 
 struct ptr_table {
 	void	 **entries;
@@ -178,15 +205,9 @@ enum dwarf_languages {
 
 /** struct debug_fmt_ops - specific to the underlying debug file format
  *
- * @function__name - will be called by function__name(), giving a chance to
- *		     formats such as CTF to get this from some other place
- *		     than the global strings table. CTF does this by storing
- * 		     GElf_Sym->st_name in function->name, and by using
- *		     function->name as an index into the .strtab ELF section.
- * @variable__name - will be called by variable__name(), see @function_name
  * cu__delete - called at cu__delete(), to give a chance to formats such as
  *		CTF to keep the .strstab ELF section available till the cu is
- *		deleted. See @function__name
+ *		deleted.
  */
 struct debug_fmt_ops {
 	const char	   *name;
@@ -201,13 +222,6 @@ struct debug_fmt_ops {
 					     const struct cu *cu);
 	unsigned long long (*tag__orig_id)(const struct tag *tag,
 					   const struct cu *cu);
-	void		   (*tag__free_orig_info)(struct tag *tag,
-						  struct cu *cu);
-	const char	   *(*function__name)(struct function *tag,
-					      const struct cu *cu);
-	const char	   *(*variable__name)(const struct variable *var,
-					      const struct cu *cu);
-	const char	   *(*strings__ptr)(const struct cu *cu, strings_t s);
 	void		   (*cu__delete)(struct cu *cu);
 	bool		   has_alignment_info;
 };
@@ -225,11 +239,12 @@ struct cu {
 	char		 *name;
 	char		 *filename;
 	void 		 *priv;
-	struct obstack	 obstack;
 	struct debug_fmt_ops *dfops;
 	Elf		 *elf;
 	Dwfl_Module	 *dwfl;
+	struct obstack	 obstack;
 	uint32_t	 cached_symtab_nr_entries;
+	bool		 use_obstack;
 	uint8_t		 addr_size;
 	uint8_t		 extra_dbg_info:1;
 	uint8_t		 has_addr_info:1;
@@ -249,10 +264,16 @@ struct cu {
 
 struct cu *cu__new(const char *name, uint8_t addr_size,
 		   const unsigned char *build_id, int build_id_len,
-		   const char *filename);
+		   const char *filename, bool use_obstack);
 void cu__delete(struct cu *cu);
 
-const char *cu__string(const struct cu *cu, strings_t s);
+void *cu__malloc(struct cu *cu, size_t size);
+void *cu__zalloc(struct cu *cu, size_t size);
+void cu__free(struct cu *cu, void *ptr);
+
+int cu__fprintf_ptr_table_stats_csv(struct cu *cu, FILE *fp);
+
+int cus__fprintf_ptr_table_stats_csv_header(FILE *fp);
 
 static inline int cu__cache_symtab(struct cu *cu)
 {
@@ -265,6 +286,11 @@ static inline int cu__cache_symtab(struct cu *cu)
 static inline __pure bool cu__is_c_plus_plus(const struct cu *cu)
 {
 	return cu->language == LANG_C_plus_plus;
+}
+
+static inline __pure bool cu__is_c(const struct cu *cu)
+{
+	return cu->language == LANG_C;
 }
 
 /**
@@ -354,20 +380,14 @@ int cu__table_add_tag_with_id(struct cu *cu, struct tag *tag, uint32_t id);
 int cu__table_nullify_type_entry(struct cu *cu, uint32_t id);
 struct tag *cu__find_base_type_by_name(const struct cu *cu, const char *name,
 				       type_id_t *id);
-struct tag *cu__find_base_type_by_sname_and_size(const struct cu *cu,
-						 strings_t name,
-						 uint16_t bit_size,
-						 type_id_t *idp);
+struct tag *cu__find_base_type_by_name_and_size(const struct cu *cu, const char* name,
+						uint16_t bit_size, type_id_t *idp);
 struct tag *cu__find_enumeration_by_name(const struct cu *cu, const char *name, type_id_t *idp);
-struct tag *cu__find_enumeration_by_sname_and_size(const struct cu *cu,
-						   strings_t sname,
-						   uint16_t bit_size,
-						   type_id_t *idp);
+struct tag *cu__find_enumeration_by_name_and_size(const struct cu *cu, const char* name,
+						  uint16_t bit_size, type_id_t *idp);
 struct tag *cu__find_first_typedef_of_type(const struct cu *cu,
 					   const type_id_t type);
 struct tag *cu__find_function_by_name(const struct cu *cu, const char *name);
-struct tag *cu__find_struct_by_sname(const struct cu *cu, strings_t sname,
-				     const int include_decls, type_id_t *idp);
 struct function *cu__find_function_at_addr(const struct cu *cu,
 					   uint64_t addr);
 struct tag *cu__function(const struct cu *cu, const uint32_t id);
@@ -394,6 +414,7 @@ struct tag {
 	uint16_t	 tag;
 	bool		 visited;
 	bool		 top_level;
+	bool		 has_btf_type_tag;
 	uint16_t	 recursivity_level;
 	void		 *priv;
 };
@@ -404,7 +425,7 @@ struct tag_cu {
 	struct cu	 *cu;
 };
 
-void tag__delete(struct tag *tag, struct cu *cu);
+void tag__delete(struct tag *tag);
 
 static inline int tag__is_enumeration(const struct tag *tag)
 {
@@ -514,7 +535,8 @@ static inline int tag__is_tag_type(const struct tag *tag)
 	       tag->tag == DW_TAG_restrict_type ||
 	       tag->tag == DW_TAG_subroutine_type ||
 	       tag->tag == DW_TAG_unspecified_type ||
-	       tag->tag == DW_TAG_volatile_type;
+	       tag->tag == DW_TAG_volatile_type ||
+	       tag->tag == DW_TAG_LLVM_annotation;
 }
 
 static inline const char *tag__decl_file(const struct tag *tag,
@@ -541,12 +563,6 @@ static inline unsigned long long tag__orig_id(const struct tag *tag,
 	return 0;
 }
 
-static inline void tag__free_orig_info(struct tag *tag, struct cu *cu)
-{
-	if (cu->dfops && cu->dfops->tag__free_orig_info)
-		cu->dfops->tag__free_orig_info(tag, cu);
-}
-
 size_t tag__fprintf_decl_info(const struct tag *tag,
 			      const struct cu *cu, FILE *fp);
 size_t tag__fprintf(struct tag *tag, const struct cu *cu,
@@ -561,7 +577,7 @@ void tag__not_found_die(const char *file, int line, const char *func);
 					  __LINE__, __func__); } while (0)
 
 size_t tag__size(const struct tag *tag, const struct cu *cu);
-size_t tag__nr_cachelines(const struct tag *tag, const struct cu *cu);
+size_t tag__nr_cachelines(const struct conf_fprintf *conf, const struct tag *tag, const struct cu *cu);
 struct tag *tag__follow_typedef(const struct tag *tag, const struct cu *cu);
 struct tag *tag__strip_typedefs_and_modifiers(const struct tag *tag, const struct cu *cu);
 
@@ -587,19 +603,57 @@ static inline struct ptr_to_member_type *
 	return (struct ptr_to_member_type *)tag;
 }
 
+struct llvm_annotation {
+	const char		*value;
+	int16_t			component_idx;
+	struct list_head	node;
+};
+
+/** struct btf_type_tag_type - representing a btf_type_tag annotation
+ *
+ * @tag   - DW_TAG_LLVM_annotation tag
+ * @value - btf_type_tag value string
+ * @node  - list_head node
+ */
+struct btf_type_tag_type {
+	struct tag		tag;
+	const char		*value;
+	struct list_head	node;
+};
+
+/** The struct btf_type_tag_ptr_type - type containing both pointer type and
+ *  its btf_type_tag annotations
+ *
+ * @tag  - pointer type tag
+ * @tags - btf_type_tag annotations for the pointer type
+ */
+struct btf_type_tag_ptr_type {
+	struct tag		tag;
+	struct list_head 	tags;
+};
+
+static inline struct btf_type_tag_ptr_type *tag__btf_type_tag_ptr(struct tag *tag)
+{
+	return (struct btf_type_tag_ptr_type *)tag;
+}
+
+static inline struct btf_type_tag_type *tag__btf_type_tag(struct tag *tag)
+{
+	return (struct btf_type_tag_type *)tag;
+}
+
 /** struct namespace - base class for enums, structs, unions, typedefs, etc
  *
- * @sname - for clones, for instance, where we can't always add a new string
  * @tags - class_member, enumerators, etc
  * @shared_tags: if this bit is set, don't free the entries in @tags
  */
 struct namespace {
 	struct tag	 tag;
-	strings_t	 name;
+	const char	 *name;
 	uint16_t	 nr_tags;
 	uint8_t		 shared_tags;
-	char *		 sname;
 	struct list_head tags;
+	struct list_head annots;
 };
 
 static inline struct namespace *tag__namespace(const struct tag *tag)
@@ -607,7 +661,7 @@ static inline struct namespace *tag__namespace(const struct tag *tag)
 	return (struct namespace *)tag;
 }
 
-void namespace__delete(struct namespace *nspace, struct cu *cu);
+void namespace__delete(struct namespace *nspace);
 
 /**
  * namespace__for_each_tag - iterate thru all the tags
@@ -647,7 +701,7 @@ static inline struct inline_expansion *
 
 struct label {
 	struct ip_tag	 ip;
-	strings_t	 name;
+	const char	 *name;
 };
 
 static inline struct label *tag__label(const struct tag *tag)
@@ -655,10 +709,9 @@ static inline struct label *tag__label(const struct tag *tag)
 	return (struct label *)tag;
 }
 
-static inline const char *label__name(const struct label *label,
-				      const struct cu *cu)
+static inline const char *label__name(const struct label *label)
 {
-	return cu__string(cu, label->name);
+	return label->name;
 }
 
 enum vscope {
@@ -676,12 +729,14 @@ struct location {
 
 struct variable {
 	struct ip_tag	 ip;
-	strings_t	 name;
+	const char	 *name;
 	uint8_t		 external:1;
 	uint8_t		 declaration:1;
+	uint8_t		 has_specification:1;
 	enum vscope	 scope;
 	struct location	 location;
 	struct hlist_node tool_hnode;
+	struct list_head annots;
 	struct variable  *spec;
 };
 
@@ -693,7 +748,7 @@ static inline struct variable *tag__variable(const struct tag *tag)
 enum vscope variable__scope(const struct variable *var);
 const char *variable__scope_str(const struct variable *var);
 
-const char *variable__name(const struct variable *var, const struct cu *cu);
+const char *variable__name(const struct variable *var);
 
 const char *variable__type_name(const struct variable *var,
 				const struct cu *cu, char *bf, size_t len);
@@ -714,7 +769,7 @@ static inline struct lexblock *tag__lexblock(const struct tag *tag)
 	return (struct lexblock *)tag;
 }
 
-void lexblock__delete(struct lexblock *lexblock, struct cu *cu);
+void lexblock__delete(struct lexblock *lexblock);
 
 struct function;
 
@@ -729,8 +784,8 @@ size_t lexblock__fprintf(const struct lexblock *lexblock, const struct cu *cu,
 			 const struct conf_fprintf *conf, FILE *fp);
 
 struct parameter {
-	struct tag	 tag;
-	strings_t	 name;
+	struct tag tag;
+	const char *name;
 };
 
 static inline struct parameter *tag__parameter(const struct tag *tag)
@@ -738,10 +793,9 @@ static inline struct parameter *tag__parameter(const struct tag *tag)
 	return (struct parameter *)tag;
 }
 
-static inline const char *parameter__name(const struct parameter *parm,
-					  const struct cu *cu)
+static inline const char *parameter__name(const struct parameter *parm)
 {
-	return cu__string(cu, parm->name);
+	return parm->name;
 }
 
 /*
@@ -759,7 +813,7 @@ static inline struct ftype *tag__ftype(const struct tag *tag)
 	return (struct ftype *)tag;
 }
 
-void ftype__delete(struct ftype *ftype, struct cu *cu);
+void ftype__delete(struct ftype *ftype);
 
 /**
  * ftype__for_each_parameter - iterate thru all the parameters
@@ -802,8 +856,8 @@ struct function {
 	struct ftype	 proto;
 	struct lexblock	 lexblock;
 	struct rb_node	 rb_node;
-	strings_t	 name;
-	strings_t	 linkage_name;
+	const char	 *name;
+	const char	 *linkage_name;
 	uint32_t	 cu_total_size_inline_expansions;
 	uint16_t	 cu_total_nr_inline_expansions;
 	uint8_t		 inlined:2;
@@ -815,6 +869,7 @@ struct function {
 	uint8_t		 btf:1;
 	int32_t		 vtable_entry;
 	struct list_head vtable_node;
+	struct list_head annots;
 	/* fields used by tools */
 	union {
 		struct list_head  tool_node;
@@ -833,7 +888,7 @@ static inline struct tag *function__tag(const struct function *func)
 	return (struct tag *)func;
 }
 
-void function__delete(struct function *func, struct cu *cu);
+void function__delete(struct function *func);
 
 static __pure inline int tag__is_function(const struct tag *tag)
 {
@@ -848,12 +903,11 @@ static __pure inline int tag__is_function(const struct tag *tag)
 #define function__for_each_parameter(func, cu, pos) \
 	ftype__for_each_parameter(func->btf ? tag__ftype(cu__type(cu, func->proto.tag.type)) : &func->proto, pos)
 
-const char *function__name(struct function *func, const struct cu *cu);
+const char *function__name(struct function *func);
 
-static inline const char *function__linkage_name(const struct function *func,
-						 const struct cu *cu)
+static inline const char *function__linkage_name(const struct function *func)
 {
-	return cu__string(cu, func->linkage_name);
+	return func->linkage_name;
 }
 
 size_t function__fprintf_stats(const struct tag *tag_func,
@@ -899,10 +953,11 @@ static inline int function__inlined(const struct function *func)
  * @accessibility - DW_ACCESS_{public,protected,private}
  * @virtuality - DW_VIRTUALITY_{none,virtual,pure_virtual}
  * @hole - If there is a hole before the next one (or the end of the struct)
+ * @has_bit_offset: Don't recalcule this, it came from the debug info (DWARF5's DW_AT_data_bit_offset)
  */
 struct class_member {
 	struct tag	 tag;
-	strings_t	 name;
+	const char	 *name;
 	uint32_t	 bit_offset;
 	uint32_t	 bit_size;
 	uint32_t	 byte_offset;
@@ -915,22 +970,22 @@ struct class_member {
 	uint32_t	 alignment;
 	uint8_t		 visited:1;
 	uint8_t		 is_static:1;
+	uint8_t		 has_bit_offset:1;
 	uint8_t		 accessibility:2;
 	uint8_t		 virtuality:2;
 	uint16_t	 hole;
 };
 
-void class_member__delete(struct class_member *member, struct cu *cu);
+void class_member__delete(struct class_member *member);
 
 static inline struct class_member *tag__class_member(const struct tag *tag)
 {
 	return (struct class_member *)tag;
 }
 
-static inline const char *class_member__name(const struct class_member *member,
-					     const struct cu *cu)
+static inline const char *class_member__name(const struct class_member *member)
 {
-	return cu__string(cu, member->name);
+	return member->name;
 }
 
 static __pure inline int tag__is_class_member(const struct tag *tag)
@@ -951,7 +1006,8 @@ struct tag_cu_node {
 /**
  * struct type - base type for enumerations, structs and unions
  *
- * @nnr_members: number of non static DW_TAG_member entries
+ * @node: Used in emissions->fwd_decls, i.e. only on the 'dwarves_emit.c' file
+ * @nr_members: number of non static DW_TAG_member entries
  * @nr_static_members: number of static DW_TAG_member entries
  * @nr_tags: number of tags
  * @alignment: DW_AT_alignement, zero if not present, gcc emits since circa 7.3.1
@@ -988,6 +1044,8 @@ struct type {
 
 void __type__init(struct type *type);
 
+size_t tag__natural_alignment(struct tag *tag, const struct cu *cu);
+
 static inline struct class *type__class(const struct type *type)
 {
 	return (struct class *)type;
@@ -998,7 +1056,17 @@ static inline struct tag *type__tag(const struct type *type)
 	return (struct tag *)type;
 }
 
-void type__delete(struct type *type, struct cu *cu);
+void type__delete(struct type *type);
+
+static inline struct class_member *type__first_member(struct type *type)
+{
+	return list_first_entry(&type->namespace.tags, struct class_member, tag.node);
+}
+
+static inline struct class_member *class_member__next(struct class_member *member)
+{
+	return list_entry(member->tag.node.next, struct class_member, tag.node);
+}
 
 /**
  * type__for_each_tag - iterate thru all the tags
@@ -1093,16 +1161,9 @@ struct class_member *
 	type__find_first_biggest_size_base_type_member(struct type *type,
 						       const struct cu *cu);
 
-struct class_member *type__find_member_by_name(const struct type *type,
-					       const struct cu *cu,
-					       const char *name);
+struct class_member *type__find_member_by_name(const struct type *type, const char *name);
 uint32_t type__nr_members_of_type(const struct type *type, const type_id_t oftype);
 struct class_member *type__last_member(struct type *type);
-
-void enumeration__calc_prefix(struct type *type, const struct cu *cu);
-const char *enumeration__prefix(struct type *type, const struct cu *cu);
-uint16_t enumeration__prefix_len(struct type *type, const struct cu *cu);
-int enumeration__max_entry_name_len(struct type *type, const struct cu *cu);
 
 void enumerations__calc_prefix(struct list_head *enumerations);
 
@@ -1139,31 +1200,27 @@ static inline struct tag *class__tag(const struct class *cls)
 	return (struct tag *)cls;
 }
 
-struct class *class__clone(const struct class *from,
-			   const char *new_class_name, struct cu *cu);
-void class__delete(struct class *cls, struct cu *cu);
+struct class *class__clone(const struct class *from, const char *new_class_name);
+void class__delete(struct class *cls);
 
 static inline struct list_head *class__tags(struct class *cls)
 {
 	return &cls->type.namespace.tags;
 }
 
-static __pure inline const char *namespace__name(const struct namespace *nspace,
-						 const struct cu *cu)
+static __pure inline const char *namespace__name(const struct namespace *nspace)
 {
-	return nspace->sname ?: cu__string(cu, nspace->name);
+	return nspace->name;
 }
 
-static __pure inline const char *type__name(const struct type *type,
-					    const struct cu *cu)
+static __pure inline const char *type__name(const struct type *type)
 {
-	return namespace__name(&type->namespace, cu);
+	return namespace__name(&type->namespace);
 }
 
-static __pure inline const char *class__name(struct class *cls,
-					     const struct cu *cu)
+static __pure inline const char *class__name(struct class *cls)
 {
-	return type__name(&cls->type, cu);
+	return type__name(&cls->type);
 }
 
 static inline int class__is_struct(const struct class *cls)
@@ -1184,10 +1241,9 @@ size_t class__fprintf(struct class *cls, const struct cu *cu, FILE *fp);
 
 void class__add_vtable_entry(struct class *cls, struct function *vtable_entry);
 static inline struct class_member *
-	class__find_member_by_name(const struct class *cls,
-				   const struct cu *cu, const char *name)
+	class__find_member_by_name(const struct class *cls, const char *name)
 {
-	return type__find_member_by_name(&cls->type, cu, name);
+	return type__find_member_by_name(&cls->type, name);
 }
 
 static inline uint16_t class__nr_members(const struct class *cls)
@@ -1253,7 +1309,7 @@ enum base_type_float_type {
 
 struct base_type {
 	struct tag	tag;
-	strings_t	name;
+	const char	*name;
 	uint16_t	bit_size;
 	uint8_t		name_has_encoding:1;
 	uint8_t		is_signed:1;
@@ -1272,10 +1328,10 @@ static inline uint16_t base_type__size(const struct tag *tag)
 	return tag__base_type(tag)->bit_size / 8;
 }
 
-const char *base_type__name(const struct base_type *btype, const struct cu *cu,
-			    char *bf, size_t len);
+const char *__base_type__name(const struct base_type *bt);
 
-void base_type_name_to_size_table__init(struct strings *strings);
+const char *base_type__name(const struct base_type *btype, char *bf, size_t len);
+
 size_t base_type__name_to_size(struct base_type *btype, struct cu *cu);
 
 struct array_type {
@@ -1302,24 +1358,24 @@ static inline struct string_type *tag__string_type(const struct tag *tag)
 
 struct enumerator {
 	struct tag	 tag;
-	strings_t	 name;
+	const char	 *name;
 	uint32_t	 value;
 	struct tag_cu	 type_enum; // To cache the type_enum searches
 };
 
-static inline const char *enumerator__name(const struct enumerator *enumerator,
-					   const struct cu *cu)
+static inline const char *enumerator__name(const struct enumerator *enumerator)
 {
-	return cu__string(cu, enumerator->name);
+	return enumerator->name;
 }
 
-void enumeration__delete(struct type *type, struct cu *cu);
+void enumeration__delete(struct type *type);
 void enumeration__add(struct type *type, struct enumerator *enumerator);
-size_t enumeration__fprintf(const struct tag *tag_enum, const struct cu *cu,
+size_t enumeration__fprintf(const struct tag *tag_enum,
 			    const struct conf_fprintf *conf, FILE *fp);
 
-int dwarves__init(uint16_t user_cacheline_size);
+int dwarves__init(void);
 void dwarves__exit(void);
+void dwarves__resolve_cacheline_size(const struct conf_load *conf, uint16_t user_cacheline_size);
 
 const char *dwarf_tag_name(const uint32_t tag);
 
@@ -1328,7 +1384,7 @@ struct argp_state;
 void dwarves_print_version(FILE *fp, struct argp_state *state);
 void dwarves_print_numeric_version(FILE *fp);
 
-extern bool print_numeric_version;;
+extern bool print_numeric_version;
 
 extern bool no_bitfield_type_recode;
 

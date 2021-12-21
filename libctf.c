@@ -19,7 +19,6 @@
 #include "ctf.h"
 #include "dutil.h"
 #include "gobuffer.h"
-#include "pahole_strings.h"
 
 bool ctf__ignore_symtab_function(const GElf_Sym *sym, const char *sym_name)
 {
@@ -133,8 +132,7 @@ int ctf__load(struct ctf *ctf)
 {
 	int err = -ENOTSUP;
 	GElf_Shdr shdr;
-	Elf_Scn *sec = elf_section_by_name(ctf->elf, &ctf->ehdr,
-					   &shdr, ".SUNW_ctf", NULL);
+	Elf_Scn *sec = elf_section_by_name(ctf->elf, &shdr, ".SUNW_ctf", NULL);
 
 	if (sec == NULL)
 		return -ESRCH;
@@ -229,7 +227,7 @@ out_close:
 	if (elf == NULL)
 		close(ctf->in_fd);
 out_delete_filename:
-	free(ctf->filename);
+	zfree(&ctf->filename);
 out_delete:
 	free(ctf);
 	return NULL;
@@ -246,8 +244,8 @@ void ctf__delete(struct ctf *ctf)
 		__gobuffer__delete(&ctf->types);
 		__gobuffer__delete(&ctf->funcs);
 		elf_symtab__delete(ctf->symtab);
-		free(ctf->filename);
-		free(ctf->buf);
+		zfree(&ctf->filename);
+		zfree(&ctf->buf);
 		free(ctf);
 	}
 }
@@ -284,7 +282,7 @@ size_t ctf__get_size(struct ctf *ctf)
 
 int ctf__load_symtab(struct ctf *ctf)
 {
-	ctf->symtab = elf_symtab__new(".symtab", ctf->elf, &ctf->ehdr);
+	ctf->symtab = elf_symtab__new(".symtab", ctf->elf);
 	return ctf->symtab == NULL ? -1 : 0;
 }
 
@@ -505,6 +503,7 @@ int ctf__add_object(struct ctf *ctf, uint16_t type)
 			     sizeof(type)) >= 0 ? 0 : -ENOMEM;
 }
 
+#if 0
 static const void *ctf__compress(void *orig_buf, unsigned int *size)
 {
 	z_stream z = {
@@ -770,3 +769,4 @@ out_close:
 	close(fd);
 	return err;
 }
+#endif

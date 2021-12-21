@@ -10,10 +10,14 @@
 #include <dwarf.h>
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <inttypes.h>
 #include <elfutils/version.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 #include "config.h"
 #include "dwarves.h"
@@ -80,6 +84,15 @@ static const char *dwarf_tag_names[] = {
 	[DW_TAG_type_unit]		  = "type_unit",
 	[DW_TAG_rvalue_reference_type]    = "rvalue_reference_type",
 #endif
+#if _ELFUTILS_PREREQ(0, 170)
+	[DW_TAG_coarray_type]		  = "coarray_type",
+	[DW_TAG_generic_subrange]	  = "generic_subrange",
+	[DW_TAG_dynamic_type]		  = "dynamic_type",
+	[DW_TAG_call_site]		  = "call_site",
+	[DW_TAG_call_site_parameter]	  = "call_site_parameter",
+	[DW_TAG_skeleton_unit]		  = "skeleton_unit",
+	[DW_TAG_immutable_type]		  = "immutable_type",
+#endif
 };
 
 static const char *dwarf_gnu_tag_names[] = {
@@ -103,10 +116,14 @@ static const char *dwarf_gnu_tag_names[] = {
 const char *dwarf_tag_name(const uint32_t tag)
 {
 	if (tag >= DW_TAG_array_type && tag <=
+#if _ELFUTILS_PREREQ(0, 170)
+		DW_TAG_immutable_type
+#else
 #ifdef STB_GNU_UNIQUE
 		DW_TAG_rvalue_reference_type
 #else
 		DW_TAG_shared_type
+#endif
 #endif
 	    )
 		return dwarf_tag_names[tag];
@@ -123,7 +140,7 @@ const char *dwarf_tag_name(const uint32_t tag)
 	return "INVALID";
 }
 
-static const struct conf_fprintf conf_fprintf__defaults = {
+static struct conf_fprintf conf_fprintf__defaults = {
 	.name_spacing = 23,
 	.type_spacing = 26,
 	.emit_stats   = 1,
@@ -131,11 +148,10 @@ static const struct conf_fprintf conf_fprintf__defaults = {
 
 const char tabs[] = "\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t";
 
-static size_t cacheline_size;
 
-size_t tag__nr_cachelines(const struct tag *tag, const struct cu *cu)
+size_t tag__nr_cachelines(const struct conf_fprintf *conf, const struct tag *tag, const struct cu *cu)
 {
-	return (tag__size(tag, cu) + cacheline_size - 1) / cacheline_size;
+	return (tag__size(tag, cu) + conf->cacheline_size - 1) / conf->cacheline_size;
 }
 
 static const char *tag__accessibility(const struct tag *tag)
@@ -248,8 +264,7 @@ static size_t array_type__fprintf(const struct tag *tag,
 	return printed;
 }
 
-static size_t string_type__fprintf(const struct tag *tag,
-				   const struct cu *cu, const char *name,
+static size_t string_type__fprintf(const struct tag *tag, const char *name,
 				   const struct conf_fprintf *conf,
 				   FILE *fp)
 {
@@ -274,21 +289,19 @@ size_t typedef__fprintf(const struct tag *tag, const struct cu *cu,
 	 * to avoid all these checks?
 	 */
 	if (tag->type == 0)
-		return fprintf(fp, "typedef void %s", type__name(type, cu));
+		return fprintf(fp, "typedef void %s", type__name(type));
 
 	tag_type = cu__type(cu, tag->type);
 	if (tag_type == NULL) {
 		printed = fprintf(fp, "typedef ");
 		printed += tag__id_not_found_fprintf(fp, tag->type);
-		return printed + fprintf(fp, " %s", type__name(type, cu));
+		return printed + fprintf(fp, " %s", type__name(type));
 	}
 
 	switch (tag_type->tag) {
 	case DW_TAG_array_type:
 		printed = fprintf(fp, "typedef ");
-		return printed + array_type__fprintf(tag_type, cu,
-						     type__name(type, cu),
-						     pconf, fp);
+		return printed + array_type__fprintf(tag_type, cu, type__name(type), pconf, fp);
 	case DW_TAG_pointer_type:
 		if (tag_type->type == 0) /* void pointer */
 			break;
@@ -296,8 +309,7 @@ size_t typedef__fprintf(const struct tag *tag, const struct cu *cu,
 		if (ptr_type == NULL) {
 			printed = fprintf(fp, "typedef ");
 			printed += tag__id_not_found_fprintf(fp, tag_type->type);
-			return printed + fprintf(fp, " *%s",
-						 type__name(type, cu));
+			return printed + fprintf(fp, " *%s", type__name(type));
 		}
 		if (ptr_type->tag != DW_TAG_subroutine_type)
 			break;
@@ -306,40 +318,35 @@ size_t typedef__fprintf(const struct tag *tag, const struct cu *cu,
 		/* Fall thru */
 	case DW_TAG_subroutine_type:
 		printed = fprintf(fp, "typedef ");
-		return printed + ftype__fprintf(tag__ftype(tag_type), cu,
-						type__name(type, cu),
-						0, is_pointer, 0,
-						true, pconf, fp);
+		return printed + ftype__fprintf(tag__ftype(tag_type), cu, type__name(type),
+						0, is_pointer, 0, true, pconf, fp);
 	case DW_TAG_class_type:
 	case DW_TAG_structure_type: {
 		struct type *ctype = tag__type(tag_type);
 
-		if (type__name(ctype, cu) != NULL)
-			return fprintf(fp, "typedef struct %s %s",
-				       type__name(ctype, cu),
-				       type__name(type, cu));
+		if (type__name(ctype) != NULL)
+			return fprintf(fp, "typedef struct %s %s", type__name(ctype), type__name(type));
 
 		struct conf_fprintf tconf = *pconf;
 
-		tconf.suffix = type__name(type, cu);
+		tconf.suffix = type__name(type);
 		return fprintf(fp, "typedef ") + __class__fprintf(tag__class(tag_type), cu, &tconf, fp);
 	}
 	case DW_TAG_enumeration_type: {
 		struct type *ctype = tag__type(tag_type);
 
-		if (type__name(ctype, cu) != NULL)
-			return fprintf(fp, "typedef enum %s %s", type__name(ctype, cu), type__name(type, cu));
+		if (type__name(ctype) != NULL)
+			return fprintf(fp, "typedef enum %s %s", type__name(ctype), type__name(type));
 
 		struct conf_fprintf tconf = *pconf;
 
-		tconf.suffix = type__name(type, cu);
-		return fprintf(fp, "typedef ") + enumeration__fprintf(tag_type, cu, &tconf, fp);
+		tconf.suffix = type__name(type);
+		return fprintf(fp, "typedef ") + enumeration__fprintf(tag_type, &tconf, fp);
 	}
 	}
 
 	return fprintf(fp, "typedef %s %s",
-		       tag__name(tag_type, cu, bf, sizeof(bf), pconf),
-				 type__name(type, cu));
+		       tag__name(tag_type, cu, bf, sizeof(bf), pconf), type__name(type));
 }
 
 static size_t imported_declaration__fprintf(const struct tag *tag,
@@ -365,12 +372,12 @@ static size_t imported_module__fprintf(const struct tag *tag,
 	const char *name = "<IMPORTED MODULE ERROR!>";
 
 	if (tag__is_namespace(module))
-		name = namespace__name(tag__namespace(module), cu);
+		name = namespace__name(tag__namespace(module));
 
 	return fprintf(fp, "using namespace %s", name);
 }
 
-int enumeration__max_entry_name_len(struct type *type, const struct cu *cu)
+static int enumeration__max_entry_name_len(struct type *type)
 {
 	if (type->max_tag_name_len)
 		goto out;
@@ -378,7 +385,7 @@ int enumeration__max_entry_name_len(struct type *type, const struct cu *cu)
 	struct enumerator *pos;
 
 	type__for_each_enumerator(type, pos) {
-		int len = strlen(enumerator__name(pos, cu));
+		int len = strlen(enumerator__name(pos));
 
 		if (type->max_tag_name_len < len)
 			type->max_tag_name_len = len;
@@ -387,23 +394,23 @@ out:
 	return type->max_tag_name_len;
 }
 
-size_t enumeration__fprintf(const struct tag *tag, const struct cu *cu,
-			    const struct conf_fprintf *conf, FILE *fp)
+size_t enumeration__fprintf(const struct tag *tag, const struct conf_fprintf *conf, FILE *fp)
 {
 	struct type *type = tag__type(tag);
 	struct enumerator *pos;
-	int max_entry_name_len = enumeration__max_entry_name_len(type, cu);
-	size_t printed = fprintf(fp, "enum%s%s {\n",
-				 type__name(type, cu) ? " " : "",
-				 type__name(type, cu) ?: "");
+	int max_entry_name_len = enumeration__max_entry_name_len(type);
+	size_t printed = fprintf(fp, "enum%s%s {\n", type__name(type) ? " " : "", type__name(type) ?: "");
 	int indent = conf->indent;
 
 	if (indent >= (int)sizeof(tabs))
 		indent = sizeof(tabs) - 1;
 
-	type__for_each_enumerator(type, pos)
-		printed += fprintf(fp, "%.*s\t%-*s = %u,\n", indent, tabs,
-				   max_entry_name_len, enumerator__name(pos, cu), pos->value);
+	type__for_each_enumerator(type, pos) {
+		printed += fprintf(fp, "%.*s\t%-*s = ", indent, tabs,
+				   max_entry_name_len, enumerator__name(pos));
+		printed += fprintf(fp, conf->hex_fmt ?  "%#x" : "%u", pos->value);
+		printed += fprintf(fp, ",\n");
+	}
 
 	printed += fprintf(fp, "%.*s}", indent, tabs);
 
@@ -494,14 +501,13 @@ static const char *__tag__name(const struct tag *tag, const struct cu *cu,
 		char bf2[64];
 
 		if (bt->name)
-			name = base_type__name(tag__base_type(tag), cu,
-					       bf2, sizeof(bf2));
+			name = base_type__name(tag__base_type(tag), bf2, sizeof(bf2));
 
 		strncpy(bf, name, len);
 	}
 		break;
 	case DW_TAG_subprogram:
-		strncpy(bf, function__name(tag__function(tag), cu), len);
+		strncpy(bf, function__name(tag__function(tag)), len);
 		break;
 	case DW_TAG_pointer_type:
 		return tag__ptr_name(tag, cu, bf, len, "*");
@@ -513,8 +519,7 @@ static const char *__tag__name(const struct tag *tag, const struct cu *cu,
 
 		type = cu__type(cu, id);
 		if (type != NULL)
-			snprintf(suffix, sizeof(suffix), "%s::*",
-				 class__name(tag__class(type), cu));
+			snprintf(suffix, sizeof(suffix), "%s::*", class__name(tag__class(type)));
 		else {
 			size_t l = tag__id_not_found_snprintf(suffix,
 							      sizeof(suffix),
@@ -564,14 +569,14 @@ static const char *__tag__name(const struct tag *tag, const struct cu *cu,
 	}
 		break;
 	case DW_TAG_member:
-		snprintf(bf, len, "%s", class_member__name(tag__class_member(tag), cu));
+		snprintf(bf, len, "%s", class_member__name(tag__class_member(tag)));
 		break;
 	case DW_TAG_variable:
-		snprintf(bf, len, "%s", variable__name(tag__variable(tag), cu));
+		snprintf(bf, len, "%s", variable__name(tag__variable(tag)));
 		break;
 	default:
 		snprintf(bf, len, "%s%s", tag__prefix(cu, tag->tag, pconf),
-			 type__name(tag__type(tag), cu) ?: "");
+			 type__name(tag__type(tag)) ?: "");
 		break;
 	}
 
@@ -618,7 +623,7 @@ static size_t type__fprintf_stats(struct type *type, const struct cu *cu,
 {
 	size_t printed = fprintf(fp, "\n%.*s/* size: %d, cachelines: %zd, members: %u",
 				 conf->indent, tabs, type->size,
-				 tag__nr_cachelines(type__tag(type), cu), type->nr_members);
+				 tag__nr_cachelines(conf, type__tag(type), cu), type->nr_members);
 
 	if (type->nr_static_members != 0)
 		printed += fprintf(fp, ", static members: %u */\n", type->nr_static_members);
@@ -697,11 +702,9 @@ static size_t type__fprintf(struct tag *type, const struct cu *cu,
 
 			ctype = tag__type(type);
 			if (typedef_expanded)
-				printed += fprintf(fp, " -> %s",
-						   type__name(ctype, cu));
+				printed += fprintf(fp, " -> %s", type__name(ctype));
 			else {
-				printed += fprintf(fp, "/* typedef %s",
-						   type__name(ctype, cu));
+				printed += fprintf(fp, "/* typedef %s", type__name(ctype));
 				typedef_expanded = 1;
 			}
 			type_type = cu__type(cu, type->type);
@@ -746,7 +749,7 @@ next_type:
 				break;
 			}
 			if ((tag__is_struct(ptype) || tag__is_union(ptype) ||
-			    tag__is_enumeration(ptype)) && type__name(tag__type(ptype), cu) == NULL) {
+			    tag__is_enumeration(ptype)) && type__name(tag__type(ptype)) == NULL) {
 				if (name == namebfptr)
 					goto out_type_not_found;
 				snprintf(namebfptr, sizeof(namebfptr), "* %.*s", (int)sizeof(namebfptr) - 3, name);
@@ -785,18 +788,18 @@ print_default:
 		printed += array_type__fprintf(type, cu, name, &tconf, fp);
 		break;
 	case DW_TAG_string_type:
-		printed += string_type__fprintf(type, cu, name, &tconf, fp);
+		printed += string_type__fprintf(type, name, &tconf, fp);
 		break;
 	case DW_TAG_class_type:
 	case DW_TAG_structure_type:
 		ctype = tag__type(type);
 
-		if (type__name(ctype, cu) != NULL && !expand_types) {
+		if (type__name(ctype) != NULL && !expand_types) {
 			printed += fprintf(fp, "%s %-*s %s",
 					   (type->tag == DW_TAG_class_type &&
 					    !tconf.classes_as_structs) ? "class" : "struct",
 					   tconf.type_spacing - 7,
-					   type__name(ctype, cu), name);
+					   type__name(ctype), name ?: "");
 		} else {
 			struct class *cclass = tag__class(type);
 
@@ -810,10 +813,8 @@ print_default:
 	case DW_TAG_union_type:
 		ctype = tag__type(type);
 
-		if (type__name(ctype, cu) != NULL && !expand_types) {
-			printed += fprintf(fp, "union %-*s %s",
-					   tconf.type_spacing - 6,
-					   type__name(ctype, cu), name);
+		if (type__name(ctype) != NULL && !expand_types) {
+			printed += fprintf(fp, "union %-*s %s", tconf.type_spacing - 6, type__name(ctype), name ?: "");
 		} else {
 			tconf.type_spacing -= 8;
 			printed += union__fprintf(ctype, cu, &tconf, fp);
@@ -822,12 +823,10 @@ print_default:
 	case DW_TAG_enumeration_type:
 		ctype = tag__type(type);
 
-		if (type__name(ctype, cu) != NULL)
-			printed += fprintf(fp, "enum %-*s %s",
-					   tconf.type_spacing - 5,
-					   type__name(ctype, cu), name);
+		if (type__name(ctype) != NULL)
+			printed += fprintf(fp, "enum %-*s %s", tconf.type_spacing - 5, type__name(ctype), name ?: "");
 		else
-			printed += enumeration__fprintf(type, cu, &tconf, fp);
+			printed += enumeration__fprintf(type, &tconf, fp);
 		break;
 	}
 out:
@@ -850,10 +849,11 @@ static size_t class_member__fprintf(struct class_member *member, bool union_memb
 				     struct conf_fprintf *conf, FILE *fp)
 {
 	const int size = member->byte_size;
+	int member_alignment_printed = 0;
 	struct conf_fprintf sconf = *conf;
 	uint32_t offset = member->byte_offset;
 	size_t printed = 0, printed_cacheline = 0;
-	const char *cm_name = class_member__name(member, cu),
+	const char *cm_name = class_member__name(member),
 		   *name = cm_name;
 
 	if (!sconf.rel_offset) {
@@ -876,7 +876,21 @@ static size_t class_member__fprintf(struct class_member *member, bool union_memb
 	if (member->is_static)
 		printed += fprintf(fp, "static ");
 
-	printed += type__fprintf(type, cu, name, &sconf, fp);
+	/* For struct-like constructs, the name of the member cannot be
+	 * conflated with the name of its type, otherwise __attribute__ are
+	 * printed in the wrong order.
+	 */
+	if (tag__is_union(type) || tag__is_struct(type) ||
+	    tag__is_enumeration(type)) {
+		printed += type__fprintf(type, cu, NULL, &sconf, fp);
+		if (name) {
+			if (!type__name(tag__type(type)))
+				printed += fprintf(fp, " ");
+			printed += fprintf(fp, "%s", name);
+		}
+	} else {
+		printed += type__fprintf(type, cu, name, &sconf, fp);
+	}
 
 	if (member->is_static) {
 		if (member->const_value != 0)
@@ -885,8 +899,10 @@ static size_t class_member__fprintf(struct class_member *member, bool union_memb
 		printed += fprintf(fp, ":%u", member->bitfield_size);
 	}
 
-	if (!sconf.suppress_aligned_attribute && member->alignment != 0)
-		printed += fprintf(fp, " __attribute__((__aligned__(%u)))", member->alignment);
+	if (!sconf.suppress_aligned_attribute && member->alignment != 0) {
+		member_alignment_printed = fprintf(fp, " __attribute__((__aligned__(%u)))", member->alignment);
+		printed += member_alignment_printed;
+	}
 
 	fputc(';', fp);
 	++printed;
@@ -894,21 +910,15 @@ static size_t class_member__fprintf(struct class_member *member, bool union_memb
 	if ((tag__is_union(type) || tag__is_struct(type) ||
 	     tag__is_enumeration(type)) &&
 		/* Look if is a type defined inline */
-	    type__name(tag__type(type), cu) == NULL) {
+	    type__name(tag__type(type)) == NULL) {
 		if (!sconf.suppress_offset_comment) {
 			/* Check if this is a anonymous union */
-			int slen = cm_name ? (int)strlen(cm_name) : -1;
+			int slen = member_alignment_printed + (cm_name ? (int)strlen(cm_name) : -1);
 			int size_spacing = 5;
 
 			if (tag__is_struct(type) && tag__class(type)->is_packed && !conf->suppress_packed) {
 				int packed_len = sizeof("__attribute__((__packed__))");
 				slen += packed_len;
-			}
-
-			if (tag__type(type)->alignment != 0 && !conf->suppress_aligned_attribute) {
-				char bftmp[64];
-				int aligned_len = snprintf(bftmp, sizeof(bftmp), " __attribute__((__aligned__(%u)))", tag__type(type)->alignment);
-				slen += aligned_len;
 			}
 
 			printed += fprintf(fp, sconf.hex_fmt ?
@@ -995,8 +1005,8 @@ static size_t union__fprintf(struct type *type, const struct cu *cu,
 
 	if (conf->prefix != NULL)
 		printed += fprintf(fp, "%s ", conf->prefix);
-	printed += fprintf(fp, "union%s%s {\n", type__name(type, cu) ? " " : "",
-			   type__name(type, cu) ?: "");
+	printed += fprintf(fp, "union%s%s {\n", type__name(type) ? " " : "",
+			   type__name(type) ?: "");
 
 	uconf = *conf;
 	uconf.indent = indent + 1;
@@ -1081,7 +1091,7 @@ size_t ftype__fprintf_parms(const struct ftype *ftype,
 						   indent, tabs);
 		} else
 			first_parm = 0;
-		name = conf->no_parm_names ? NULL : parameter__name(pos, cu);
+		name = conf->no_parm_names ? NULL : parameter__name(pos);
 		type = cu__type(cu, pos->tag.type);
 		if (type == NULL) {
 			snprintf(sbf, sizeof(sbf),
@@ -1155,7 +1165,7 @@ static size_t function__tag_fprintf(const struct tag *tag, const struct cu *cu,
 			break;
 		}
 		printed = fprintf(fp, "%.*s", indent, tabs);
-		name = function__name(alias, cu);
+		name = function__name(alias);
 		n = fprintf(fp, "%s", name);
 		size_t namelen = 0;
 		if (name != NULL)
@@ -1167,7 +1177,7 @@ static size_t function__tag_fprintf(const struct tag *tag, const struct cu *cu,
 			     exp->size, (unsigned long long)exp->ip.addr);
 #if 0
 		n = fprintf(fp, "%s(); /* size=%zd, low_pc=%#llx */",
-			    function__name(alias, cu), exp->size,
+			    function__name(alias), exp->size,
 			    (unsigned long long)exp->ip.addr);
 #endif
 		c = 69;
@@ -1178,7 +1188,7 @@ static size_t function__tag_fprintf(const struct tag *tag, const struct cu *cu,
 		printed = fprintf(fp, "%.*s", indent, tabs);
 		n = fprintf(fp, "%s %s; /* scope: %s */",
 			    variable__type_name(vtag, cu, bf, sizeof(bf)),
-			    variable__name(vtag, cu),
+			    variable__name(vtag),
 			    variable__scope_str(vtag));
 		c += n;
 		printed += n;
@@ -1188,7 +1198,7 @@ static size_t function__tag_fprintf(const struct tag *tag, const struct cu *cu,
 		printed = fprintf(fp, "%.*s", indent, tabs);
 		fputc('\n', fp);
 		++printed;
-		c = fprintf(fp, "%s:", label__name(label, cu));
+		c = fprintf(fp, "%s:", label__name(label));
 		printed += c;
 	}
 		break;
@@ -1227,7 +1237,7 @@ size_t lexblock__fprintf(const struct lexblock *block, const struct cu *cu,
 					   (unsigned long long)block->ip.addr);
 		else
 			printed += fprintf(fp, " /* %s+%#llx */",
-					   function__name(function, cu),
+					   function__name(function),
 					   (unsigned long long)offset);
 	}
 	printed += fprintf(fp, "\n");
@@ -1272,7 +1282,7 @@ static size_t function__fprintf(const struct tag *tag, const struct cu *cu,
 	    func->virtuality == DW_VIRTUALITY_pure_virtual)
 		printed += fprintf(fp, "virtual ");
 
-	printed += ftype__fprintf(ftype, cu, function__name(func, cu),
+	printed += ftype__fprintf(ftype, cu, function__name(func),
 				  inlined, 0, 0, false, conf, fp);
 
 	if (func->virtuality == DW_VIRTUALITY_pure_virtual)
@@ -1306,11 +1316,11 @@ static size_t class__fprintf_cacheline_boundary(struct conf_fprintf *conf,
 						FILE *fp)
 {
 	int indent = conf->indent;
-	uint32_t cacheline = offset / cacheline_size;
+	uint32_t cacheline = offset / conf->cacheline_size;
 	size_t printed = 0;
 
 	if (cacheline > *conf->cachelinep) {
-		const uint32_t cacheline_pos = offset % cacheline_size;
+		const uint32_t cacheline_pos = offset % conf->cacheline_size;
 		const uint32_t cacheline_in_bytes = offset - cacheline_pos;
 
 		if (cacheline_pos == 0)
@@ -1330,8 +1340,7 @@ static size_t class__fprintf_cacheline_boundary(struct conf_fprintf *conf,
 	return printed;
 }
 
-static size_t class__vtable_fprintf(struct class *class, const struct cu *cu,
-				    const struct conf_fprintf *conf, FILE *fp)
+static size_t class__vtable_fprintf(struct class *class, const struct conf_fprintf *conf, FILE *fp)
 {
 	struct function *pos;
 	size_t printed = 0;
@@ -1345,8 +1354,8 @@ static size_t class__vtable_fprintf(struct class *class, const struct cu *cu,
 	list_for_each_entry(pos, &class->vtable, vtable_node) {
 		printed += fprintf(fp, "%.*s   [%d] = %s(%s), \n",
 				   conf->indent, tabs, pos->vtable_entry,
-				   function__name(pos, cu),
-				   function__linkage_name(pos, cu));
+				   function__name(pos),
+				   function__linkage_name(pos));
 	}
 
 	printed += fprintf(fp, "%.*s} */", conf->indent, tabs);
@@ -1381,8 +1390,8 @@ static size_t __class__fprintf(struct class *class, const struct cu *cu,
 				   t == DW_TAG_structure_type) ? "struct" :
 				  t == DW_TAG_class_type ? "class" :
 							"interface"),
-				 type__name(type, cu) ? " " : "",
-				 type__name(type, cu) ?: "");
+				 type__name(type) ? " " : "",
+				 type__name(type) ?: "");
 	int indent = cconf.indent;
 
 	if (indent >= (int)sizeof(tabs))
@@ -1421,7 +1430,7 @@ static size_t __class__fprintf(struct class *class, const struct cu *cu,
 		struct tag *pos_type = cu__type(cu, tag_pos->type);
 		if (pos_type != NULL)
 			printed += fprintf(fp, " %s",
-					   type__name(tag__type(pos_type), cu));
+					   type__name(tag__type(pos_type)));
 		else
 			printed += tag__id_not_found_fprintf(fp, tag_pos->type);
 	}
@@ -1702,7 +1711,7 @@ static size_t __class__fprintf(struct class *class, const struct cu *cu,
 	}
 
 	if (!cconf.show_only_data_members)
-		class__vtable_fprintf(class, cu, &cconf, fp);
+		class__vtable_fprintf(class, &cconf, fp);
 
 	if (!cconf.emit_stats)
 		goto out;
@@ -1753,7 +1762,7 @@ static size_t __class__fprintf(struct class *class, const struct cu *cu,
 		}
 		printed += fprintf(fp, " */\n");
 	}
-	cacheline = (cconf.base_offset + type->size) % cacheline_size;
+	cacheline = (cconf.base_offset + type->size) % conf->cacheline_size;
 	if (cacheline != 0)
 		printed += fprintf(fp, "%.*s/* last cacheline: %u bytes */\n",
 				   cconf.indent, tabs,
@@ -1764,7 +1773,7 @@ static size_t __class__fprintf(struct class *class, const struct cu *cu,
 
 		printed += fprintf(fp, "%.*s/* first biggest size base type member: %s %u %zd */\n",
 				   cconf.indent, tabs,
-				   class_member__name(m, cu), m->byte_offset,
+				   class_member__name(m), m->byte_offset,
 				   m->byte_size);
 	}
 
@@ -1806,7 +1815,7 @@ static size_t variable__fprintf(const struct tag *tag, const struct cu *cu,
 				const struct conf_fprintf *conf, FILE *fp)
 {
 	const struct variable *var = tag__variable(tag);
-	const char *name = variable__name(var, cu);
+	const char *name = variable__name(var);
 	size_t printed = 0;
 
 	if (name != NULL) {
@@ -1827,8 +1836,7 @@ static size_t namespace__fprintf(const struct tag *tag, const struct cu *cu,
 {
 	struct namespace *space = tag__namespace(tag);
 	struct conf_fprintf cconf = *conf;
-	size_t printed = fprintf(fp, "namespace %s {\n",
-				 namespace__name(space, cu));
+	size_t printed = fprintf(fp, "namespace %s {\n", namespace__name(space));
 	struct tag *pos;
 
 	++cconf.indent;
@@ -1887,7 +1895,7 @@ size_t tag__fprintf(struct tag *tag, const struct cu *cu,
 		printed += array_type__fprintf(tag, cu, "array", pconf, fp);
 		break;
 	case DW_TAG_enumeration_type:
-		printed += enumeration__fprintf(tag, cu, pconf, fp);
+		printed += enumeration__fprintf(tag, pconf, fp);
 		break;
 	case DW_TAG_typedef:
 		printed += typedef__fprintf(tag, cu, pconf, fp);
@@ -1933,8 +1941,7 @@ size_t tag__fprintf(struct tag *tag, const struct cu *cu,
 		const struct function *func = tag__function(tag);
 
 		if (func->linkage_name)
-			printed += fprintf(fp, " /* linkage=%s */",
-					   function__linkage_name(func, cu));
+			printed += fprintf(fp, " /* linkage=%s */", function__linkage_name(func));
 	}
 
 	if (pconf->expand_types)
@@ -1946,22 +1953,58 @@ size_t tag__fprintf(struct tag *tag, const struct cu *cu,
 void cus__print_error_msg(const char *progname, const struct cus *cus,
 			  const char *filename, const int err)
 {
-	if (err == -EINVAL || (cus != NULL && list_empty(&cus->cus)))
+	if (err == -EINVAL || (cus != NULL && cus__empty(cus)))
 		fprintf(stderr, "%s: couldn't load debugging info from %s\n",
 		       progname, filename);
 	else
-		fprintf(stderr, "%s: %s\n", progname, strerror(err));
+		fprintf(stderr, "%s: %s\n", progname, strerror(-err));
 }
 
-void dwarves__fprintf_init(uint16_t user_cacheline_size)
+#ifndef _SC_LEVEL1_DCACHE_LINESIZE
+int filename__read_int(const char *filename, int *value)
 {
+        char line[64];
+        int fd = open(filename, O_RDONLY), err = -1;
+
+        if (fd < 0)
+                return -1;
+
+        if (read(fd, line, sizeof(line)) > 0) {
+                *value = atoi(line);
+                err = 0;
+        }
+
+        close(fd);
+        return err;
+}
+#endif
+
+static long cacheline__size(void)
+{
+#ifdef _SC_LEVEL1_DCACHE_LINESIZE
+	return sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+#else
+	int value;
+	return filename__read_int("/sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size", &value) == 0 ? value : -1;
+#endif
+}
+
+void dwarves__resolve_cacheline_size(const struct conf_load *conf, uint16_t user_cacheline_size)
+{
+	uint16_t size;
+
 	if (user_cacheline_size == 0) {
-		long sys_cacheline_size = sysconf(_SC_LEVEL1_DCACHE_LINESIZE);
+		long sys_cacheline_size = cacheline__size();
 
 		if (sys_cacheline_size > 0)
-			cacheline_size = sys_cacheline_size;
+			size = sys_cacheline_size;
 		else
-			cacheline_size = 64; /* Fall back to a sane value */
+			size = 64; /* Fall back to a sane value */
 	} else
-		cacheline_size = user_cacheline_size;
+		size = user_cacheline_size;
+
+	if (conf)
+		conf->conf_fprintf->cacheline_size = size;
+
+	conf_fprintf__defaults.cacheline_size = size;
 }

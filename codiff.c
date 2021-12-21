@@ -87,7 +87,7 @@ static void diff_function(const struct cu *new_cu, struct function *function,
 	if (function->inlined || function->abstract_origin != 0)
 		return;
 
-	name = function__name(function, cu);
+	name = function__name(function);
 	new_tag = cu__find_function_by_name(new_cu, name);
 	if (new_tag != NULL) {
 		struct function *new_function = tag__function(new_tag);
@@ -173,7 +173,7 @@ static int check_print_change(const struct class_member *old,
 		printf("    %s\n"
 		       "     from:    %-21s /* %5u(%2u) %5zd(%2d) */\n"
 		       "     to:      %-21s /* %5u(%2u) %5zd(%2u) */\n",
-		       class_member__name(old, old_cu),
+		       class_member__name(old),
 		       old_type_name, old->byte_offset, old->bitfield_offset,
 		       old_size, old->bitfield_size,
 		       new_type_name, new->byte_offset, new->bitfield_offset,
@@ -182,15 +182,15 @@ static int check_print_change(const struct class_member *old,
 	return changes;
 }
 
-static struct class_member *class__find_pair_member(const struct class *structure, const struct cu *cu,
-						    const struct class_member *pair_member, const struct cu *pair_cu,
+static struct class_member *class__find_pair_member(const struct class *structure,
+						    const struct class_member *pair_member,
 						    int *nr_anonymousp)
 {
-	const char *member_name = class_member__name(pair_member, pair_cu);
+	const char *member_name = class_member__name(pair_member);
 	struct class_member *member;
 
 	if (member_name)
-		return class__find_member_by_name(structure, cu, member_name);
+		return class__find_member_by_name(structure, member_name);
 
 	int nr_anonymous = ++*nr_anonymousp;
 
@@ -198,7 +198,7 @@ static struct class_member *class__find_pair_member(const struct class *structur
 
 	type__for_each_member(&structure->type, member) {
 		if (member->tag.tag == pair_member->tag.tag && /* Both are class/union/struct (unnamed) */
-		    class_member__name(member, cu) == member_name && /* Both are NULL? */
+		    class_member__name(member) == member_name && /* Both are NULL? */
 		    --nr_anonymous == 0)
 			return member;
 	}
@@ -217,7 +217,7 @@ static int check_print_members_changes(const struct class *structure,
 	uint16_t nr_twins_found = 0;
 
 	type__for_each_member(&structure->type, member) {
-		struct class_member *twin = class__find_pair_member(new_structure, new_cu, member, cu, &nr_anonymous);
+		struct class_member *twin = class__find_pair_member(new_structure, member, &nr_anonymous);
 		if (twin != NULL) {
 			twin->tag.visited = 1;
 			++nr_twins_found;
@@ -231,7 +231,7 @@ static int check_print_members_changes(const struct class *structure,
 				type = cu__type(cu, member->tag.type);
 				printf("    %s\n"
 				       "     removed: %-21s /* %5u(%2u) %5zd(%2d) */\n",
-				       class_member__name(member, cu),
+				       class_member__name(member),
 				       tag__name(type, cu, name, sizeof(name), NULL),
 				       member->byte_offset, member->bitfield_offset,
 				       member->byte_size, member->bitfield_size);
@@ -254,7 +254,7 @@ static int check_print_members_changes(const struct class *structure,
 			type = cu__type(new_cu, member->tag.type);
 			printf("    %s\n"
 			       "     added:   %-21s /* %5u(%2u) %5zd(%2d) */\n",
-			       class_member__name(member, new_cu),
+			       class_member__name(member),
 			       tag__name(type, new_cu, name, sizeof(name), NULL),
 			       member->byte_offset, member->bitfield_offset,
 			       member->byte_size, member->bitfield_size);
@@ -273,11 +273,10 @@ static void diff_struct(const struct cu *new_cu, struct class *structure,
 
 	assert(class__is_struct(structure));
 
-	if (class__size(structure) == 0 || class__name(structure, cu) == NULL)
+	if (class__size(structure) == 0 || class__name(structure) == NULL)
 		return;
 
-	new_tag = cu__find_struct_by_name(new_cu,
-					  class__name(structure, cu), 0, NULL);
+	new_tag = cu__find_struct_by_name(new_cu, class__name(structure), 0, NULL);
 	if (new_tag == NULL)
 		return;
 
@@ -299,18 +298,9 @@ static void diff_struct(const struct cu *new_cu, struct class *structure,
 		return;
 
 	++cu->nr_structures_changed;
-	cu__check_max_len_changed_item(cu, class__name(structure, cu),
-				       sizeof("struct"));
+	cu__check_max_len_changed_item(cu, class__name(structure), sizeof("struct"));
 	structure->priv = diff_info__new(class__tag(new_structure),
 					 new_cu, diff);
-}
-
-static struct cu *cus__find_pair(struct cus *cus, const char *name)
-{
-	if (cus->nr_entries == 1)
-		return list_first_entry(&cus->cus, struct cu, node);
-
-	return cus__find_cu_by_name(cus, name);
 }
 
 static int cu_find_new_tags_iterator(struct cu *new_cu, void *old_cus)
@@ -330,7 +320,7 @@ static int cu_find_new_tags_iterator(struct cu *new_cu, void *old_cus)
 		if (function->abstract_origin || function->inlined)
 			continue;
 
-		const char *name = function__name(function, new_cu);
+		const char *name = function__name(function);
 		struct tag *old_function = cu__find_function_by_name(old_cu,
 								     name);
 		if (old_function != NULL && !tag__function(old_function)->inlined)
@@ -346,7 +336,7 @@ static int cu_find_new_tags_iterator(struct cu *new_cu, void *old_cus)
 
 	struct class *class;
 	cu__for_each_struct(new_cu, id, class) {
-		const char *name = class__name(class, new_cu);
+		const char *name = class__name(class);
 		if (name == NULL || class__size(class) == 0 ||
 		    cu__find_struct_by_name(old_cu, name, 0, NULL))
 			continue;
@@ -386,7 +376,7 @@ static void show_diffs_function(struct function *function, const struct cu *cu,
 
 	printf("  %-*.*s | %+4d",
 	       (int)cu->max_len_changed_item, (int)cu->max_len_changed_item,
-	       function__name(function, cu), di->diff);
+	       function__name(function), di->diff);
 
 	if (!verbose) {
 		putchar('\n');
@@ -400,12 +390,12 @@ static void show_diffs_function(struct function *function, const struct cu *cu,
 
 		if (twin->inlined)
 			puts(cookie ? " (uninlined)" : " (inlined)");
-		else if (strcmp(function__name(function, cu),
-				function__name(twin, di->cu)) != 0)
+		else if (strcmp(function__name(function),
+				function__name(twin)) != 0)
 			printf("%s: BRAIN FART ALERT: comparing %s to %s, "
 			       "should be the same name\n", __FUNCTION__,
-			       function__name(function, cu),
-			       function__name(twin, di->cu));
+			       function__name(function),
+			       function__name(twin));
 		else {
 			char proto[1024], twin_proto[1024];
 
@@ -446,7 +436,7 @@ static void show_changed_member(char change, const struct class_member *member,
 	tag__assert_search_result(type);
 	printf("    %c%-26s %-21s /* %5u %5zd */\n",
 	       change, tag__name(type, cu, bf, sizeof(bf), NULL),
-	       class_member__name(member, cu),
+	       class_member__name(member),
 	       member->byte_offset, member->byte_size);
 }
 
@@ -460,7 +450,7 @@ static void show_nr_members_changes(const struct class *structure,
 
 	/* Find the removed ones */
 	type__for_each_member(&structure->type, member) {
-		struct class_member *twin = class__find_pair_member(new_structure, new_cu, member, cu, &nr_anonymous);
+		struct class_member *twin = class__find_pair_member(new_structure, member, &nr_anonymous);
 		if (twin == NULL)
 			show_changed_member('-', member, cu);
 	}
@@ -468,18 +458,17 @@ static void show_nr_members_changes(const struct class *structure,
 	nr_anonymous = 0;
 	/* Find the new ones */
 	type__for_each_member(&new_structure->type, member) {
-		struct class_member *twin = class__find_pair_member(structure, cu, member, new_cu, &nr_anonymous);
+		struct class_member *twin = class__find_pair_member(structure, member, &nr_anonymous);
 		if (twin == NULL)
 			show_changed_member('+', member, new_cu);
 	}
 }
 
-static void print_terse_type_changes(struct class *structure,
-				     const struct cu *cu)
+static void print_terse_type_changes(struct class *structure)
 {
 	const char *sep = "";
 
-	printf("struct %s: ", class__name(structure, cu));
+	printf("struct %s: ", class__name(structure));
 
 	if (terse_type_changes & TCHANGEF__SIZE) {
 		fputs("size", stdout);
@@ -549,7 +538,7 @@ static void show_diffs_structure(struct class *structure,
 		printf("  struct %-*.*s | %+4d\n",
 		       (int)(cu->max_len_changed_item - sizeof("struct")),
 		       (int)(cu->max_len_changed_item - sizeof("struct")),
-		       class__name(structure, cu), diff);
+		       class__name(structure), diff);
 
 	if (diff != 0)
 		terse_type_changes |= TCHANGEF__SIZE;
@@ -595,13 +584,13 @@ static void show_diffs_structure(struct class *structure,
 					    new_structure, di->cu, 1);
 	}
 	if (show_terse_type_changes)
-		print_terse_type_changes(structure, cu);
+		print_terse_type_changes(structure);
 }
 
 static void show_structure_diffs_iterator(struct class *class, struct cu *cu)
 {
 	if (class->priv != NULL) {
-		const char *name = class__name(class, cu);
+		const char *name = class__name(class);
 		if (!strlist__has_entry(structs_printed, name)) {
 			show_diffs_structure(class, cu);
 			strlist__add(structs_printed, name);
@@ -672,17 +661,17 @@ static int cu_show_diffs_iterator(struct cu *cu, void *cookie)
 	return 0;
 }
 
-static int cu_delete_priv(struct cu *cu, void *cookie __unused)
+static int cu_delete_priv(struct cu *cu, void *cookie __maybe_unused)
 {
 	struct class *c;
 	struct function *f;
 	uint32_t id;
 
 	cu__for_each_struct(cu, id, c)
-		free(c->priv);
+		zfree(&c->priv);
 
 	cu__for_each_function(cu, id, f)
-		free(f->priv);
+		zfree(&f->priv);
 
 	return 0;
 }
@@ -746,8 +735,8 @@ static const struct argp_option codiff__options[] = {
 	}
 };
 
-static error_t codiff__options_parser(int key, char *arg __unused,
-				      struct argp_state *state __unused)
+static error_t codiff__options_parser(int key, char *arg __maybe_unused,
+				      struct argp_state *state __maybe_unused)
 {
 	switch (key) {
 	case 'f': show_function_diffs = 1;	break;
@@ -789,10 +778,12 @@ failure:
 		goto out;
 	}
 
-	if (dwarves__init(0)) {
+	if (dwarves__init()) {
 		fputs("codiff: insufficient memory\n", stderr);
 		goto out;
 	}
+
+	dwarves__resolve_cacheline_size(&conf_load, 0);
 
 	if (show_function_diffs == 0 && show_struct_diffs == 0 &&
 	    show_terse_type_changes == 0)
@@ -814,7 +805,7 @@ failure:
 	/* If old_file is a character device, leave its cus empty */
 	if (!S_ISCHR(st.st_mode)) {
 		err = cus__load_file(old_cus, &conf_load, old_filename);
-		if (err != 0) {
+		if (err < 0) {
 			cus__print_error_msg("codiff", old_cus, old_filename, err);
 			goto out_cus_delete_priv;
 		}
@@ -828,7 +819,7 @@ failure:
 	/* If old_file is a character device, leave its cus empty */
 	if (!S_ISCHR(st.st_mode)) {
 		err = cus__load_file(new_cus, &conf_load, new_filename);
-		if (err != 0) {
+		if (err < 0) {
 			cus__print_error_msg("codiff", new_cus, new_filename, err);
 			goto out_cus_delete_priv;
 		}
@@ -837,7 +828,7 @@ failure:
 	cus__for_each_cu(old_cus, cu_diff_iterator, new_cus, NULL);
 	cus__for_each_cu(new_cus, cu_find_new_tags_iterator, old_cus, NULL);
 	cus__for_each_cu(old_cus, cu_show_diffs_iterator, NULL, NULL);
-	if (new_cus->nr_entries > 1)
+	if (cus__nr_entries(new_cus) > 1)
 		cus__for_each_cu(new_cus, cu_show_diffs_iterator, (void *)1, NULL);
 
 	if (total_cus_changed > 1) {

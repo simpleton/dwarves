@@ -15,6 +15,8 @@ dwarves_fprintf.c
 dwarves_reorganize.c
 dwarves_reorganize.h
 cmake/modules/FindDWARF.cmake
+cmake/modules/Findargp.cmake
+cmake/modules/Findobstack.cmake
 CMakeLists.txt
 codiff.c
 ctracer.c
@@ -27,8 +29,6 @@ fullcircle
 gobuffer.c
 gobuffer.h
 hash.h
-libbtf.c
-libbtf.h
 list.h
 MANIFEST
 man-pages/pahole.1
@@ -41,8 +41,6 @@ rbtree.c
 rbtree.h
 scncopy.c
 syscse.c
-strings.c
-pahole_strings.h
 dutil.c
 dutil.h
 changes-v1.13
@@ -50,6 +48,11 @@ changes-v1.16
 changes-v1.17
 changes-v1.18
 changes-v1.19
+changes-v1.20
+changes-v1.21
+changes-v1.22
+changes-v1.23
+buildcmd.sh
 COPYING
 NEWS
 README
@@ -69,3 +72,4 @@ libctf.c
 libctf.h
 regtest
 lib/bpf/
+lib/include/bpf

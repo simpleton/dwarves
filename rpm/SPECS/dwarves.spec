@@ -2,7 +2,7 @@
 %define libver 1
 
 Name: dwarves
-Version: 1.19
+Version: 1.23
 Release: 1%{?dist}
 License: GPLv2
 Summary: Debugging Information Manipulation Tools (pahole & friends)
@@ -10,7 +10,7 @@ URL: http://acmel.wordpress.com
 Source: http://fedorapeople.org/~acme/dwarves/%{name}-%{version}.tar.xz
 Requires: %{libname}%{libver} = %{version}-%{release}
 BuildRequires: gcc
-BuildRequires: cmake
+BuildRequires: cmake >= 2.8.12
 BuildRequires: zlib-devel
 BuildRequires: elfutils-devel >= 0.130
 
@@ -79,7 +79,7 @@ rm -Rf %{buildroot}
 %files
 %doc README.ctracer
 %doc README.btf
-%doc changes-v1.19
+%doc changes-v1.23
 %doc NEWS
 %{_bindir}/btfdiff
 %{_bindir}/codiff
@@ -114,7 +114,6 @@ rm -Rf %{buildroot}
 %doc MANIFEST README
 %{_includedir}/dwarves/btf_encoder.h
 %{_includedir}/dwarves/config.h
-%{_includedir}/dwarves/ctf_encoder.h
 %{_includedir}/dwarves/ctf.h
 %{_includedir}/dwarves/dutil.h
 %{_includedir}/dwarves/dwarves.h
@@ -124,16 +123,84 @@ rm -Rf %{buildroot}
 %{_includedir}/dwarves/elf_symtab.h
 %{_includedir}/dwarves/gobuffer.h
 %{_includedir}/dwarves/hash.h
-%{_includedir}/dwarves/libbtf.h
 %{_includedir}/dwarves/libctf.h
 %{_includedir}/dwarves/list.h
 %{_includedir}/dwarves/rbtree.h
-%{_includedir}/dwarves/pahole_strings.h
 %{_libdir}/%{libname}.so
 %{_libdir}/%{libname}_emit.so
 %{_libdir}/%{libname}_reorganize.so
 
 %changelog
+* Wed Dec  8 2021 Arnaldo Carvalho de Melo <acme@redhat.com> - 1.23-1
+- New release: v1.23
+- Process DW_TAG_LLVM_annotation tags.
+- Initial support for DW_TAG_skeleton_unit.
+- Encode BTF_KIND_TYPE_TAG and BTF_KIND_DECL_TAG
+- Fix handling of percpu symbols on s390.
+- Use cacheline size to infer struct member alignment from BTF.
+- Add --skip_missing to not stop when not finding one of -C arguments.
+- Fix __attribute__((__aligned__(N)) printing alignment for struct members.
+- Fix nested __attribute__(__aligned__(N)) struct printing order.
+
+* Mon Aug 23 2021 Arnaldo Carvalho de Melo <acme@redhat.com> - 1.22-1
+- New release: v1.22
+- Introduce -j/--jobs option to specify the number of threads to use.
+- Multithreaded DWARF loading, requires elfutils >= 0.178.
+- Preparatory work for multithreaded BTF encoding, the focus for 1.23.
+- Allow encoding BTF to a separate file.
+- Show all different types with the same name, not just the first one found.
+- Stop assuming that reading from stdin means pretty, add --prettify.
+- Improve type resolution for the --header command line option.
+- Do not consider the ftrace filter when encoding BTF for kernel functions.
+- Lock calls to non-thread safe elfutils' dwarf_decl_file() and dwarf_decl_line().
+- Change hash table size to one that performs better with current typical vmlinux files.
+- Allow tweaking the hash table size from the command line.
+- Add --kabi_prefix to avoid deduplication woes when using _RH_KABI_REPLACE().
+- Add --with_flexible_array to show just types with flexible arrays.
+- Support btfdiff with a detached BTF file.
+- Introduce sorted type output (--sort).
+- Disable incomplete CTF encoder.
+
+* Fri Apr 9 2021 Arnaldo Carvalho de Melo <acme@redhat.com> - 1.21-1
+- New release: v1.21
+- DWARF loader:
+- Handle DWARF5 DW_OP_addrx properly
+- Handle subprogram ret type with abstract_origin properly
+- Check .notes section for LTO build info
+- Check .debug_abbrev for cross-CU references
+- Permit merging all DWARF CU's for clang LTO built binary
+- Factor out common code to initialize a cu
+- Permit a flexible HASHTAGS__BITS
+- Use a better hashing function, from libbpf
+- btf_encoder:
+- Add --btf_gen_all flag
+- Match ftrace addresses within ELF functions
+- Funnel ELF error reporting through a macro
+- Sanitize non-regular int base type
+- Add support for the floating-point types
+- Pretty printer:
+- Honour conf_fprintf.hex when printing enumerations
+
+* Tue Feb 2 2021 Arnaldo Carvalho de Melo <acme@redhat.com> - 1.20-1
+- New release: v1.20
+- btf_encoder:
+- Improve ELF error reporting using elf_errmsg(elf_errno())
+- Improve objcopy error handling.
+- Fix handling of 'restrict' qualifier, that was being treated as a 'const'.
+- Support SHN_XINDEX in st_shndx symbol indexes
+- Cope with functions without a name
+- Fix BTF variable generation for kernel modules
+- Fix address size to match what is in the ELF file being processed.
+- Use kernel module ftrace addresses when finding which functions to encode.
+- libbpf:
+- Allow use of packaged version.
+- dwarf_loader:
+- Support DW_AT_data_bit_offset
+- DW_FORM_implicit_const in attr_numeric() and attr_offset()
+- Support DW_TAG_GNU_call_site, standardized rename of DW_TAG_GNU_call_site.
+- build:
+- Fix compilation on 32-bit architectures.
+
 * Fri Nov 20 2020 Arnaldo Carvalho de Melo <acme@redhat.com> - 1.19-1
 - New release: 1.19
 - Split BTF
@@ -275,7 +342,7 @@ rm -Rf %{buildroot}
 * Sat Nov 20 2010 Arnaldo Carvalho de Melo <acme@redhat.com> - 1.9-1
 - New release
 
-* Tue Feb 08 2010 Fedora Release Engineering <rel-eng@lists.fedoraproject.org> - 1.8-2
+* Mon Feb 08 2010 Fedora Release Engineering <rel-eng@lists.fedoraproject.org> - 1.8-2
 - Rebuilt for https://fedoraproject.org/wiki/Fedora_15_Mass_Rebuild
 
 * Fri Dec  4 2009 Arnaldo Carvalho de Melo <acme@redhat.com> - 1.8-1
@@ -426,7 +493,7 @@ rm -Rf %{buildroot}
 - Fix emission of arrays of structs, unions, etc
 - use sysconf for the default cacheline size
 
-* Wed Jan 18 2007 Arnaldo Carvalho de Melo <acme@ghostprotocols.net>
+* Thu Jan 18 2007 Arnaldo Carvalho de Melo <acme@ghostprotocols.net>
 - fab0db03ea9046893ca110bb2b7d71b764f61033
 - pdwtags added
 

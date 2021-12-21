@@ -10,27 +10,38 @@
 #include <assert.h>
 #include <stdio.h>
 #include <dwarf.h>
+#include <elfutils/version.h>
 #include <inttypes.h>
+#include <limits.h>
+#include <pthread.h>
 #include <search.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <bpf/btf.h>
+#include "bpf/libbpf.h"
 
 #include "dwarves_reorganize.h"
 #include "dwarves.h"
 #include "dutil.h"
-#include "ctf_encoder.h"
+//#include "ctf_encoder.h" FIXME: disabled, probably its better to move to Oracle's libctf
 #include "btf_encoder.h"
-#include "libbtf.h"
-#include "lib/bpf/src/libbpf.h"
 
+static struct btf_encoder *btf_encoder;
+static char *detached_btf_filename;
 static bool btf_encode;
+static bool btf_gen_floats;
 static bool ctf_encode;
+static bool sort_output;
+static bool need_resort;
 static bool first_obj_only;
 static bool skip_encoding_btf_vars;
 static bool btf_encode_force;
 static const char *base_btf_file;
+
+static const char *prettify_input_filename;
+static FILE *prettify_input;
 
 static uint8_t class__include_anonymous;
 static uint8_t class__include_nested_anonymous;
@@ -52,6 +63,7 @@ static uint16_t nr_holes;
 static uint16_t nr_bit_holes;
 static uint16_t hole_size_ge;
 static uint8_t show_packable;
+static bool show_with_flexible_array;
 static uint8_t global_verbose;
 static uint8_t recursive;
 static size_t cacheline_size;
@@ -79,23 +91,23 @@ static struct conf_load conf_load = {
 struct structure {
 	struct list_head  node;
 	struct rb_node	  rb_node;
-	char		  *name;
+	struct class	  *class;
+	struct cu	  *cu;
+	uint32_t	  id;
 	uint32_t	  nr_files;
 	uint32_t	  nr_methods;
 };
 
-static struct structure *structure__new(const char *name)
+static struct structure *structure__new(struct class *class, struct cu *cu, uint32_t id)
 {
 	struct structure *st = malloc(sizeof(*st));
 
 	if (st != NULL) {
-		st->name = strdup(name);
-		if (st->name == NULL) {
-			free(st);
-			return NULL;
-		}
 		st->nr_files   = 1;
 		st->nr_methods = 0;
+		st->class      = class;
+		st->cu	       = cu;
+		st->id	       = id;
 	}
 
 	return st;
@@ -103,28 +115,209 @@ static struct structure *structure__new(const char *name)
 
 static void structure__delete(struct structure *st)
 {
-	free(st->name);
+	if (st == NULL)
+		return;
+
 	free(st);
 }
 
 static struct rb_root structures__tree = RB_ROOT;
 static LIST_HEAD(structures__list);
+static pthread_mutex_t structures_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static struct structure *structures__add(struct class *class,
-					 const struct cu *cu,
-					 bool *existing_entry)
+static int type__compare_members_types(struct type *a, struct cu *cu_a, struct type *b, struct cu *cu_b)
+{
+	int ret = strcmp(type__name(a), type__name(b));
+
+	if (ret)
+		return ret;
+
+	// a->nr_members should be equal to b->nr_members at this point
+
+	if (a->nr_members == 0)
+		return 0;
+
+	struct class_member *ma, *mb = type__first_member(b);
+
+	type__for_each_member(a, ma) {
+		struct tag *type_ma = cu__type(cu_a, ma->tag.type),
+			   *type_mb = cu__type(cu_b, mb->tag.type);
+
+		if (type_ma && !type_mb && class_member__name(mb) == NULL) {
+			/*
+			 * FIXME This is happening with a vmlinux built with
+			 * clang and thin-LTO, and since this is not
+			 * multithreadeded, we can get the previous behaviour
+			 * by considering just the first occurence, the one with
+			 * all the class member names and proper types, and since
+			 * the name, size, number of members is the same, consider them equal
+			 * and use the complete type (the first one found).
+			 * With this btfdiff works for both non-thin-LTO and thin-LTO vmlinux files
+			 */
+			return 0;
+		}
+
+		if (!type_ma || !type_mb) // shuldn't happen
+			return type_ma ? 1 : -1; // best effort
+
+		const char *name_a = class_member__name(ma),
+			   *name_b = class_member__name(mb);
+
+		if (name_a && name_b) {
+			ret = strcmp(name_a, name_b);
+			if (ret)
+				return ret;
+		}
+
+		ret = (int)ma->bit_offset - (int)mb->bit_offset;
+		if (ret)
+			return ret;
+
+		ret = (int)ma->bitfield_size - (int)mb->bitfield_size;
+		if (ret)
+			return ret;
+
+		char bf_a[1024], bf_b[1024];
+
+		ret = strcmp(tag__name(type_ma, cu_a, bf_a, sizeof(bf_a), NULL),
+			     tag__name(type_mb, cu_b, bf_b, sizeof(bf_b), NULL));
+		if (ret)
+			return ret;
+
+		mb = class_member__next(mb);
+	}
+
+	return 0;
+}
+
+static int type__compare_members(struct type *a, struct type *b)
+{
+	int ret;
+
+	// a->nr_members should be equal to b->nr_members at this point
+
+	if (a->nr_members == 0)
+		return 0;
+
+	struct class_member *ma, *mb = type__first_member(b);
+
+	// Don't look at the types, as we may be referring to a CU being loaded
+	// in another thread and since we're not locking the ptr_table's, we
+	// may race When printing all the types using --sort we'll do an extra
+	// check that takes into account the types, since at that time all the
+	// ptr_tables/cus are quiescent.
+
+	type__for_each_member(a, ma) {
+		const char *name_a = class_member__name(ma),
+			   *name_b = class_member__name(mb);
+
+		if (name_a && name_b) {
+			ret = strcmp(name_a, name_b);
+			if (ret)
+				return ret;
+		}
+
+		ret = (int)ma->bit_offset - (int)mb->bit_offset;
+		if (ret)
+			return ret;
+
+		ret = (int)ma->bitfield_size - (int)mb->bitfield_size;
+		if (ret)
+			return ret;
+
+		mb = class_member__next(mb);
+	}
+
+	/*
+	   Since we didn't check the types, we may end with at least this btfdiff output:
+
++++ /tmp/btfdiff.btf.b5DJu4	2021-08-18 12:06:27.773932193 -0300
+@@ -31035,7 +31035,7 @@ struct elf_note_info {
+	struct memelfnote          auxv;                 / *    56    24 * /
+	/ * --- cacheline 1 boundary (64 bytes) was 16 bytes ago --- * /
+	struct memelfnote          files;                / *    80    24 * /
+-	compat_siginfo_t           csigdata;             / *   104   128 * /
++	siginfo_t                  csigdata;             / *   104   128 * /
+
+	   So if we're printing everything, consider the types as different and
+	   at the end with type__compare_members_types() when using --sort,
+	   we'll need as well to resort, to avoid things like:
+
+@@ -47965,8 +47965,8 @@ struct instance_attribute {
+
+	/ * XXX last struct has 6 bytes of padding * /
+
+-	ssize_t                    (*show)(struct edac_device_instance *, char *);                 / *    16     8 * /
+-	ssize_t                    (*store)(struct edac_device_instance *, const char  *, size_t); / *    24     8 * /
++	ssize_t                    (*show)(struct edac_pci_ctl_info *, char *);                    / *    16     8 * /
++	ssize_t                    (*store)(struct edac_pci_ctl_info *, const char  *, size_t);    / *    24     8 * /
+
+	/ * size: 32, cachelines: 1, members: 3 * /
+	/ * paddings: 1, sum paddings: 6 * /
+@@ -47977,8 +47977,8 @@ struct instance_attribute {
+
+	/ * XXX last struct has 6 bytes of padding * /
+
+-	ssize_t                    (*show)(struct edac_pci_ctl_info *, char *);                    / *    16     8 * /
+-	ssize_t                    (*store)(struct edac_pci_ctl_info *, const char  *, size_t);    / *    24     8 * /
++	ssize_t                    (*show)(struct edac_device_instance *, char *);                 / *    16     8 * /
++	ssize_t                    (*store)(struct edac_device_instance *, const char  *, size_t); / *    24     8 * /
+
+	/ * size: 32, cachelines: 1, members: 3 * /
+	/ * paddings: 1, sum paddings: 6 * /
+
+	   I.e. the difference is in the arguments to those show/store function
+	   pointers, but since we didn't took the types into account when first
+	   sorting, we need to resort.
+
+	   So the first sort weeds out duplicates when loading from multiple
+	   CUs, i.e. DWARF, the second will make sure both BTF and DWARF are
+	   sorted taking into account types and then btfdiff finally will be
+	   happy and we can continue to depend on it for regression tests for
+	   the BTF and DWARF encoder and loader
+
+	 */
+
+	if (sort_output) {
+		need_resort = true;
+		return 1;
+	}
+
+	return 0;
+}
+
+static int type__compare(struct type *a, struct cu *cu_a, struct type *b, struct cu *cu_b)
+{
+	int ret = strcmp(type__name(a), type__name(b));
+
+	if (ret)
+		goto found;
+
+	ret = (int)a->size - (int)b->size;
+	if (ret)
+		goto found;
+
+	ret = (int)a->nr_members - (int)b->nr_members;
+	if (ret)
+		goto found;
+
+	ret = type__compare_members(a, b);
+found:
+	return ret;
+}
+
+static struct structure *__structures__add(struct class *class, struct cu *cu, uint32_t id, bool *existing_entry)
 {
         struct rb_node **p = &structures__tree.rb_node;
         struct rb_node *parent = NULL;
 	struct structure *str;
-	const char *new_class_name = class__name(class, cu);
 
         while (*p != NULL) {
 		int rc;
 
                 parent = *p;
                 str = rb_entry(parent, struct structure, rb_node);
-		rc = strcmp(str->name, new_class_name);
+		rc = type__compare(&str->class->type, str->cu, &class->type, cu);
 
 		if (rc > 0)
                         p = &(*p)->rb_left;
@@ -136,7 +329,7 @@ static struct structure *structures__add(struct class *class,
 		}
         }
 
-	str = structure__new(new_class_name);
+	str = structure__new(class, cu, id);
 	if (str == NULL)
 		return NULL;
 
@@ -150,7 +343,18 @@ static struct structure *structures__add(struct class *class,
 	return str;
 }
 
-void structures__delete(void)
+static struct structure *structures__add(struct class *class, struct cu *cu, uint32_t id, bool *existing_entry)
+{
+	struct structure *str;
+
+	pthread_mutex_lock(&structures_lock);
+	str = __structures__add(class, cu, id, existing_entry);
+	pthread_mutex_unlock(&structures_lock);
+
+	return str;
+}
+
+static void __structures__delete(void)
 {
 	struct rb_node *next = rb_first(&structures__tree);
 
@@ -162,48 +366,50 @@ void structures__delete(void)
 	}
 }
 
-static void nr_definitions_formatter(struct structure *st)
+void structures__delete(void)
 {
-	printf("%s%c%u\n", st->name, separator, st->nr_files);
+	pthread_mutex_lock(&structures_lock);
+	__structures__delete();
+	pthread_mutex_unlock(&structures_lock);
 }
 
-static void nr_members_formatter(struct class *class,
-				 struct cu *cu, uint32_t id __unused)
+static void nr_definitions_formatter(struct structure *st)
 {
-	printf("%s%c%u\n", class__name(class, cu), separator,
-	       class__nr_members(class));
+	printf("%s%c%u\n", class__name(st->class), separator, st->nr_files);
+}
+
+static void nr_members_formatter(struct class *class, struct cu *cu __maybe_unused, uint32_t id __maybe_unused)
+{
+	printf("%s%c%u\n", class__name(class), separator, class__nr_members(class));
 }
 
 static void nr_methods_formatter(struct structure *st)
 {
-	printf("%s%c%u\n", st->name, separator, st->nr_methods);
+	printf("%s%c%u\n", class__name(st->class), separator, st->nr_methods);
 }
 
-static void size_formatter(struct class *class,
-			   struct cu *cu, uint32_t id __unused)
+static void size_formatter(struct class *class, struct cu *cu __maybe_unused, uint32_t id __maybe_unused)
 {
-	printf("%s%c%d%c%u\n", class__name(class, cu), separator,
+	printf("%s%c%d%c%u\n", class__name(class), separator,
 	       class__size(class), separator, tag__is_union(class__tag(class)) ? 0 : class->nr_holes);
 }
 
-static void class_name_len_formatter(struct class *class, struct cu *cu,
-				     uint32_t id __unused)
+static void class_name_len_formatter(struct class *class, struct cu *cu __maybe_unused, uint32_t id __maybe_unused)
 {
-	const char *name = class__name(class, cu);
+	const char *name = class__name(class);
 	printf("%s%c%zd\n", name, separator, strlen(name));
 }
 
-static void class_name_formatter(struct class *class,
-				 struct cu *cu, uint32_t id __unused)
+static void class_name_formatter(struct class *class, struct cu *cu __maybe_unused, uint32_t id __maybe_unused)
 {
-	puts(class__name(class, cu));
+	puts(class__name(class));
 }
 
 static void class_formatter(struct class *class, struct cu *cu, uint32_t id)
 {
 	struct tag *typedef_alias = NULL;
 	struct tag *tag = class__tag(class);
-	const char *name = class__name(class, cu);
+	const char *name = class__name(class);
 
 	if (name == NULL) {
 		/*
@@ -227,7 +433,7 @@ static void class_formatter(struct class *class, struct cu *cu, uint32_t id)
 		struct type *tdef = tag__type(typedef_alias);
 
 		conf.prefix = "typedef";
-		conf.suffix = type__name(tdef, cu);
+		conf.suffix = type__name(tdef);
 	} else
 		conf.prefix = conf.suffix = NULL;
 
@@ -242,7 +448,7 @@ static void print_packable_info(struct class *c, struct cu *cu, uint32_t id)
 	const size_t orig_size = class__size(c);
 	const size_t new_size = class__size(c->priv);
 	const size_t savings = orig_size - new_size;
-	const char *name = class__name(c, cu);
+	const char *name = class__name(c);
 
 	/* Anonymous struct? Try finding a typedef */
 	if (name == NULL) {
@@ -250,7 +456,7 @@ static void print_packable_info(struct class *c, struct cu *cu, uint32_t id)
 		      cu__find_first_typedef_of_type(cu, id);
 
 		if (tdef != NULL)
-			name = class__name(tag__class(tdef), cu);
+			name = class__name(tag__class(tdef));
 	}
 	if (name != NULL)
 		printf("%s%c%zd%c%zd%c%zd\n",
@@ -309,7 +515,7 @@ static void print_classes(struct cu *cu)
 		 * and I'm sleepy, will leave for later...
 		 */
 		if (pos->type.namespace.name != 0) {
-			str = structures__add(pos, cu, &existing_entry);
+			str = structures__add(pos, cu, id, &existing_entry);
 			if (str == NULL) {
 				fprintf(stderr, "pahole: insufficient memory for "
 					"processing %s, skipping it...\n", cu->name);
@@ -325,10 +531,72 @@ static void print_classes(struct cu *cu)
 
 		if (show_packable && !global_verbose)
 			print_packable_info(pos, cu, id);
+		else if (sort_output && formatter == class_formatter)
+			continue; // we'll print it at the end, in order, out of structures__tree
 		else if (formatter != NULL)
 			formatter(pos, cu, id);
 	}
 }
+
+static void __print_ordered_classes(struct rb_root *root)
+{
+	struct rb_node *next = rb_first(root);
+
+	while (next) {
+		struct structure *st = rb_entry(next, struct structure, rb_node);
+
+		class_formatter(st->class, st->cu, st->id);
+
+		next = rb_next(&st->rb_node);
+	}
+
+}
+
+static void resort_add(struct rb_root *resorted, struct structure *str)
+{
+	struct rb_node **p = &resorted->rb_node;
+	struct rb_node *parent = NULL;
+	struct structure *node;
+
+	while (*p != NULL) {
+		int rc;
+
+		parent = *p;
+		node = rb_entry(parent, struct structure, rb_node);
+		rc = type__compare_members_types(&node->class->type, node->cu, &str->class->type, str->cu);
+
+		if (rc > 0)
+			p = &(*p)->rb_left;
+		else if (rc < 0)
+			p = &(*p)->rb_right;
+		else
+			return; // Duplicate, ignore it
+	}
+
+	rb_link_node(&str->rb_node, parent, p);
+	rb_insert_color(&str->rb_node, resorted);
+}
+
+static void resort_classes(struct rb_root *resorted, struct list_head *head)
+{
+	struct structure *str;
+
+	list_for_each_entry(str, head, node)
+		resort_add(resorted, str);
+}
+
+static void print_ordered_classes(void)
+{
+	if (!need_resort) {
+		__print_ordered_classes(&structures__tree);
+	} else {
+		struct rb_root resorted = RB_ROOT;
+
+		resort_classes(&resorted, &structures__list);
+		__print_ordered_classes(&resorted);
+	}
+}
+
 
 static struct cu *cu__filter(struct cu *cu)
 {
@@ -348,7 +616,7 @@ static int class__packable(struct class *class, struct cu *cu)
 	if (class->nr_holes == 0 && class->nr_bit_holes == 0)
 		return 0;
 
-	clone = class__clone(class, NULL, cu);
+	clone = class__clone(class, NULL);
 	if (clone == NULL)
 		return 0;
 	class__reorganize(clone, cu, 0, stdout);
@@ -356,11 +624,31 @@ static int class__packable(struct class *class, struct cu *cu)
 		class->priv = clone;
 		return 1;
 	}
-	/* FIXME: we need to free in the right order,
-	 *	  cu->obstack is being corrupted...
-	class__delete(clone, cu);
-	*/
+	class__delete(clone);
 	return 0;
+}
+
+static bool class__has_flexible_array(struct class *class, struct cu *cu)
+{
+	struct class_member *member = type__last_member(&class->type);
+
+	if (member == NULL)
+		return false;
+
+	struct tag *type = cu__type(cu, member->tag.type);
+
+	if (type->tag != DW_TAG_array_type)
+		return false;
+
+	struct array_type *array = tag__array_type(type);
+
+	if (array->dimensions > 1)
+		return false;
+
+	if (array->nr_entries == NULL || array->nr_entries[0] == 0)
+		return true;
+
+	return false;
 }
 
 static struct class *class__filter(struct class *class, struct cu *cu,
@@ -388,7 +676,7 @@ static struct class *class__filter(struct class *class, struct cu *cu,
 			return NULL;
 	}
 
-	name = class__name(class, cu);
+	name = class__name(class);
 
 	if (class__is_declaration(class))
 		return NULL;
@@ -403,7 +691,7 @@ static struct class *class__filter(struct class *class, struct cu *cu,
 			if (tdef != NULL) {
 				struct class *c = tag__class(tdef);
 
-				name = class__name(c, cu);
+				name = class__name(c);
 			}
 		}
 		if (name != NULL && strncmp(class__exclude_prefix, name,
@@ -418,7 +706,7 @@ static struct class *class__filter(struct class *class, struct cu *cu,
 			if (tdef != NULL) {
 				struct class *c = tag__class(tdef);
 
-				name = class__name(c, cu);
+				name = class__name(c);
 			}
 		}
 		if (name != NULL && strncmp(class__include_prefix, name,
@@ -455,6 +743,9 @@ static struct class *class__filter(struct class *class, struct cu *cu,
 		return NULL;
 
 	if (show_packable && !class__packable(class, cu))
+		return NULL;
+
+	if (show_with_flexible_array && !class__has_flexible_array(class, cu))
 		return NULL;
 
 	return class;
@@ -509,13 +800,12 @@ static void class__resize_LP(struct tag *tag, struct cu *cu)
 		case DW_TAG_base_type: {
 			struct base_type *bt = tag__base_type(type);
 			char bf[64];
-			const char *name = base_type__name(bt, cu, bf,
-							   sizeof(bf));
+			const char *name = base_type__name(bt, bf, sizeof(bf));
 			if (strcmp(name, "long int") != 0 &&
 			    strcmp(name, "long unsigned int") != 0)
 				break;
-			/* fallthru */
 		}
+			/* fallthru */
 		case DW_TAG_pointer_type:
 			diff = word_size_diff;
 			break;
@@ -616,7 +906,7 @@ static void tag__fixup_word_size(struct tag *tag, struct cu *cu)
 		if (!bt->name)
 			return;
 		char bf[64];
-		const char *name = base_type__name(bt, cu, bf, sizeof(bf));
+		const char *name = base_type__name(bt, bf, sizeof(bf));
 
 		if (strcmp(name, "long int") == 0 ||
 		    strcmp(name, "long unsigned int") == 0)
@@ -674,7 +964,7 @@ static void cu__account_nr_methods(struct cu *cu)
 				continue;
 
 			bool existing_entry;
-			str = structures__add(class, cu, &existing_entry);
+			str = structures__add(class, cu, id, &existing_entry);
 			if (str == NULL) {
 				fprintf(stderr, "pahole: insufficient memory "
 					"for processing %s, skipping it...\n",
@@ -723,7 +1013,7 @@ static void print_structs_with_pointer_to(struct cu *cu, uint32_t type)
 			if (!looked) {
 				bool existing_entry;
 
-				str = structures__add(pos, cu, &existing_entry);
+				str = structures__add(pos, cu, id, &existing_entry);
 				if (str == NULL) {
 					fprintf(stderr, "pahole: insufficient memory for "
 						"processing %s, skipping it...\n",
@@ -737,8 +1027,8 @@ static void print_structs_with_pointer_to(struct cu *cu, uint32_t type)
 					break;
 				looked = true;
 			}
-			printf("%s: %s\n", str->name,
-			       class_member__name(pos_member, cu));
+			printf("%s: %s\n", class__name(str->class),
+			       class_member__name(pos_member));
 		}
 	}
 }
@@ -750,8 +1040,8 @@ static int type__print_containers(struct type *type, struct cu *cu, uint32_t con
 		return 0;
 
 	if (ident == 0) {
-		bool existing_entry;
-		struct structure *str = structures__add(type__class(type), cu, &existing_entry);
+		bool existing_entry; // FIXME: This should really just search, no need to try to add it.
+		struct structure *str = structures__add(type__class(type), cu, 0, &existing_entry);
 		if (str == NULL) {
 			fprintf(stderr, "pahole: insufficient memory for "
 				"processing %s, skipping it...\n",
@@ -765,7 +1055,7 @@ static int type__print_containers(struct type *type, struct cu *cu, uint32_t con
 			return 0;
 	}
 
-	printf("%.*s%s", ident * 2, tab, type__name(type, cu));
+	printf("%.*s%s", ident * 2, tab, type__name(type));
 	if (global_verbose)
 		printf(": %u", n);
 	putchar('\n');
@@ -825,6 +1115,18 @@ ARGP_PROGRAM_VERSION_HOOK_DEF = dwarves_print_version;
 #define ARGP_just_packed_structs   319
 #define ARGP_numeric_version       320
 #define ARGP_btf_base		   321
+#define ARGP_btf_gen_floats	   322
+#define ARGP_btf_gen_all	   323
+#define ARGP_with_flexible_array   324
+#define ARGP_kabi_prefix	   325
+#define ARGP_btf_encode_detached   326
+#define ARGP_prettify_input_filename 327
+#define ARGP_sort_output	   328
+#define ARGP_hashbits		   329
+#define ARGP_devel_stats	   330
+#define ARGP_skip_encoding_btf_decl_tag 331
+#define ARGP_skip_missing          332
+#define ARGP_skip_encoding_btf_type_tag 333
 
 static const struct argp_option pahole__options[] = {
 	{
@@ -921,6 +1223,11 @@ static const struct argp_option pahole__options[] = {
 		.name = "packable",
 		.key  = 'P',
 		.doc  = "show only structs that has holes that can be packed",
+	},
+	{
+		.name = "with_flexible_array",
+		.key  = ARGP_with_flexible_array,
+		.doc  = "show only structs with a flexible array",
 	},
 	{
 		.name = "expand_types",
@@ -1051,7 +1358,7 @@ static const struct argp_option pahole__options[] = {
 	{
 		.name = "ctf_encode",
 		.key  = 'Z',
-		.doc  = "Encode as CTF",
+		.doc  = "Encode as CTF: DISABLED, consider helping porting to libctf",
 	},
 	{
 		.name = "flat_arrays",
@@ -1105,9 +1412,28 @@ static const struct argp_option pahole__options[] = {
 		.doc  = "Path to the base BTF file",
 	},
 	{
+		.name = "kabi_prefix",
+		.key  = ARGP_kabi_prefix,
+		.arg  = "STRING",
+		.doc  = "When the prefix of the string is STRING, treat the string as STRING.",
+	},
+	{
+		.name  = "jobs",
+		.key   = 'j',
+		.arg   = "NR_JOBS",
+		.flags = OPTION_ARG_OPTIONAL, // Use sysconf(_SC_NPROCESSORS_ONLN) * 1.1 by default
+		.doc   = "run N jobs in parallel [default to number of online processors + 10%]",
+	},
+	{
 		.name = "btf_encode",
 		.key  = 'J',
 		.doc  = "Encode as BTF",
+	},
+	{
+		.name = "btf_encode_detached",
+		.key  = ARGP_btf_encode_detached,
+		.arg  = "FILENAME",
+		.doc  = "Encode as BTF in a detached file",
 	},
 	{
 		.name = "skip_encoding_btf_vars",
@@ -1118,6 +1444,16 @@ static const struct argp_option pahole__options[] = {
 		.name = "btf_encode_force",
 		.key  = ARGP_btf_encode_force,
 		.doc  = "Ignore those symbols found invalid when encoding BTF."
+	},
+	{
+		.name = "btf_gen_floats",
+		.key  = ARGP_btf_gen_floats,
+		.doc  = "Allow producing BTF_KIND_FLOAT entries."
+	},
+	{
+		.name = "btf_gen_all",
+		.key  = ARGP_btf_gen_all,
+		.doc  = "Allow using all the BTF features supported by pahole."
 	},
 	{
 		.name = "structs",
@@ -1138,6 +1474,43 @@ static const struct argp_option pahole__options[] = {
 		.name = "numeric_version",
 		.key  = ARGP_numeric_version,
 		.doc  = "Print a numeric version, i.e. 119 instead of v1.19"
+	},
+	{
+		.name = "sort",
+		.key  = ARGP_sort_output,
+		.doc  = "Sort types by name",
+	},
+	{
+		.name = "prettify",
+		.key  = ARGP_prettify_input_filename,
+		.arg  = "PATH",
+		.doc  = "Path to the raw data to pretty print",
+	},
+	{
+		.name = "hashbits",
+		.key  = ARGP_hashbits,
+		.arg  = "BITS",
+		.doc  = "Number of bits for the hash table key",
+	},
+	{
+		.name = "ptr_table_stats",
+		.key  = ARGP_devel_stats,
+		.doc  = "Print internal data structures stats",
+	},
+	{
+		.name = "skip_encoding_btf_decl_tag",
+		.key  = ARGP_skip_encoding_btf_decl_tag,
+		.doc  = "Do not encode TAGs in BTF."
+	},
+	{
+		.name = "skip_missing",
+		.key  = ARGP_skip_missing,
+		.doc = "skip missing types passed to -C rather than stop",
+	},
+	{
+		.name = "skip_encoding_btf_type_tag",
+		.key  = ARGP_skip_encoding_btf_type_tag,
+		.doc  = "Do not encode TAGs in BTF."
 	},
 	{
 		.name = NULL,
@@ -1170,8 +1543,24 @@ static error_t pahole__options_parser(int key, char *arg,
 		  conf_load.extra_dbg_info = 1;		break;
 	case 'i': find_containers = 1;
 		  class_name = arg;			break;
+	case 'j':
+#if _ELFUTILS_PREREQ(0, 178)
+		  conf_load.nr_jobs = arg ? atoi(arg) :
+					    sysconf(_SC_NPROCESSORS_ONLN) * 1.1;
+#else
+		  fputs("pahole: Multithreading requires elfutils >= 0.178. Continuing with a single thread...\n", stderr);
+#endif
+							break;
+	case ARGP_btf_encode_detached:
+		  detached_btf_filename = arg; // fallthru
 	case 'J': btf_encode = 1;
 		  conf_load.get_addr_info = true;
+		  conf_load.ignore_alignment_attr = true;
+		  // XXX for now, test this more thoroughly
+		  // We may have some references from formal parameters, etc, (abstract_origin)
+		  // conf_load.ignore_inline_expansions = true;
+		  conf_load.ignore_labels	     = true;
+		  conf_load.use_obstack		     = true;
 		  no_bitfield_type_recode = true;	break;
 	case 'l': conf.show_first_biggest_size_base_type_member = 1;	break;
 	case 'M': conf.show_only_data_members = 1;	break;
@@ -1208,7 +1597,7 @@ static error_t pahole__options_parser(int key, char *arg,
 		if (!global_verbose)
 			formatter = class_name_formatter;
 		break;
-	case 'Z': ctf_encode = 1;			break;
+	// case 'Z': ctf_encode = 1;			break; // FIXME: Disabled
 	case ARGP_flat_arrays: conf.flat_arrays = 1;	break;
 	case ARGP_suppress_aligned_attribute:
 		conf.suppress_aligned_attribute = 1;	break;
@@ -1252,8 +1641,31 @@ static error_t pahole__options_parser(int key, char *arg,
 		btf_encode_force = true;		break;
 	case ARGP_btf_base:
 		base_btf_file = arg;			break;
+	case ARGP_kabi_prefix:
+		conf_load.kabi_prefix = arg;
+		conf_load.kabi_prefix_len = strlen(arg); break;
 	case ARGP_numeric_version:
 		print_numeric_version = true;		break;
+	case ARGP_btf_gen_floats:
+		btf_gen_floats = true;			break;
+	case ARGP_btf_gen_all:
+		btf_gen_floats = true;			break;
+	case ARGP_with_flexible_array:
+		show_with_flexible_array = true;	break;
+	case ARGP_prettify_input_filename:
+		prettify_input_filename = arg;		break;
+	case ARGP_sort_output:
+		sort_output = true;			break;
+	case ARGP_hashbits:
+		conf_load.hashtable_bits = atoi(arg);	break;
+	case ARGP_devel_stats:
+		conf_load.ptr_table_stats = true;	break;
+	case ARGP_skip_encoding_btf_decl_tag:
+		conf_load.skip_encoding_btf_decl_tag = true;	break;
+	case ARGP_skip_missing:
+		conf_load.skip_missing = true;          break;
+	case ARGP_skip_encoding_btf_type_tag:
+		conf_load.skip_encoding_btf_type_tag = true;	break;
 	default:
 		return ARGP_ERR_UNKNOWN;
 	}
@@ -1273,7 +1685,7 @@ static void do_reorg(struct tag *class, struct cu *cu)
 	int savings;
 	const uint8_t reorg_verbose =
 			show_reorg_steps ? 2 : global_verbose;
-	struct class *clone = class__clone(tag__class(class), NULL, cu);
+	struct class *clone = class__clone(tag__class(class), NULL);
 	if (clone == NULL) {
 		fprintf(stderr, "pahole: out of memory!\n");
 		exit(EXIT_FAILURE);
@@ -1288,8 +1700,8 @@ static void do_reorg(struct tag *class, struct cu *cu)
 	tag__fprintf(class__tag(clone), cu, &conf, stdout);
 	if (savings != 0) {
 		const size_t cacheline_savings =
-		      (tag__nr_cachelines(class, cu) -
-		       tag__nr_cachelines(class__tag(clone), cu));
+		      (tag__nr_cachelines(&conf, class, cu) -
+		       tag__nr_cachelines(&conf, class__tag(clone), cu));
 
 		printf("   /* saved %d byte%s", savings,
 		       savings != 1 ? "s" : "");
@@ -1302,13 +1714,10 @@ static void do_reorg(struct tag *class, struct cu *cu)
 	} else
 		putchar('\n');
 
-	/* FIXME: we need to free in the right order,
-	 *	  cu->obstack is being corrupted...
-	 class__delete(clone, cu);
-	*/
+	 class__delete(clone);
 }
 
-static int tag__fprintf_hexdump_value(struct tag *type, struct cu *cu, void *instance, int _sizeof, FILE *fp)
+static int instance__fprintf_hexdump_value(void *instance, int _sizeof, FILE *fp)
 {
 	uint8_t *contents = instance;
 	int i, printed = 0;
@@ -1378,13 +1787,13 @@ static int class_member__fprintf_bitfield_value(struct class_member *member, voi
 	return fprintf(fp, format, class_member__bitfield_value(member, instance));
 }
 
-static const char *enumeration__lookup_value(struct type *enumeration, struct cu *cu, uint64_t value)
+static const char *enumeration__lookup_value(struct type *enumeration, uint64_t value)
 {
 	struct enumerator *entry;
 
 	type__for_each_enumerator(enumeration, entry) {
 		if (entry->value == value)
-			return enumerator__name(entry, cu);
+			return enumerator__name(entry);
 	}
 
 	return NULL;
@@ -1395,7 +1804,7 @@ static const char *enumerations__lookup_value(struct list_head *enumerations, ui
 	struct tag_cu_node *pos;
 
 	list_for_each_entry(pos, enumerations, node) {
-		const char *s = enumeration__lookup_value(tag__type(pos->tc.tag), pos->tc.cu, value);
+		const char *s = enumeration__lookup_value(tag__type(pos->tc.tag), value);
 		if (s)
 			return s;
 	}
@@ -1403,7 +1812,7 @@ static const char *enumerations__lookup_value(struct list_head *enumerations, ui
 	return NULL;
 }
 
-static struct enumerator *enumeration__lookup_entry_from_value(struct type *enumeration, struct cu *cu, uint64_t value)
+static struct enumerator *enumeration__lookup_entry_from_value(struct type *enumeration, uint64_t value)
 {
 	struct enumerator *entry;
 
@@ -1415,14 +1824,13 @@ static struct enumerator *enumeration__lookup_entry_from_value(struct type *enum
 	return NULL;
 }
 
-static struct enumerator *enumerations__lookup_entry_from_value(struct list_head *enumerations, struct cu **cup, uint64_t value)
+static struct enumerator *enumerations__lookup_entry_from_value(struct list_head *enumerations, uint64_t value)
 {
 	struct tag_cu_node *pos;
 
 	list_for_each_entry(pos, enumerations, node) {
-		struct enumerator *enumerator = enumeration__lookup_entry_from_value(tag__type(pos->tc.tag), pos->tc.cu, value);
+		struct enumerator *enumerator = enumeration__lookup_entry_from_value(tag__type(pos->tc.tag), value);
 		if (enumerator) {
-			*cup = pos->tc.cu;
 			return enumerator;
 		}
 	}
@@ -1430,12 +1838,12 @@ static struct enumerator *enumerations__lookup_entry_from_value(struct list_head
 	return NULL;
 }
 
-static int64_t enumeration__lookup_enumerator(struct type *enumeration, struct cu *cu, const char *enumerator)
+static int64_t enumeration__lookup_enumerator(struct type *enumeration, const char *enumerator)
 {
 	struct enumerator *entry;
 
 	type__for_each_enumerator(enumeration, entry) {
-		const char *entry_name = enumerator__name(entry, cu);
+		const char *entry_name = enumerator__name(entry);
 
 		if (!strcmp(entry_name, enumerator))
 			return entry->value;
@@ -1453,7 +1861,7 @@ static int64_t enumerations__lookup_enumerator(struct list_head *enumerations, c
 	struct tag_cu_node *pos;
 
 	list_for_each_entry(pos, enumerations, node) {
-		int64_t value = enumeration__lookup_enumerator(tag__type(pos->tc.tag), pos->tc.cu, enumerator);
+		int64_t value = enumeration__lookup_enumerator(tag__type(pos->tc.tag), enumerator);
 		if (value != -1)
 			return value;
 	}
@@ -1486,7 +1894,7 @@ static int array__fprintf_base_type_value(struct tag *tag, struct cu *cu, void *
 
 	if (array->dimensions != 1) {
 		// Support multi dimensional arrays later
-		return tag__fprintf_hexdump_value(tag, cu, instance, _sizeof, fp);
+		return instance__fprintf_hexdump_value(instance, _sizeof, fp);
 	}
 
 	if (tag__is_typedef(array_type))
@@ -1523,7 +1931,7 @@ static int array__fprintf_value(struct tag *tag, struct cu *cu, void *instance, 
 	if (tag__is_base_type(array_type, cu))
 		return array__fprintf_base_type_value(tag, cu, instance, _sizeof, fp);
 
-	return tag__fprintf_hexdump_value(tag, cu, instance, _sizeof, fp);
+	return instance__fprintf_hexdump_value(instance, _sizeof, fp);
 }
 
 static int __class__fprintf_value(struct tag *tag, struct cu *cu, void *instance, int _sizeof, int indent, bool brackets, FILE *fp)
@@ -1538,7 +1946,7 @@ static int __class__fprintf_value(struct tag *tag, struct cu *cu, void *instance
 	type__for_each_member(type, member) {
 		void *member_contents = instance + member->byte_offset;
 		struct tag *member_type = cu__type(cu, member->tag.type);
-		const char *name = class_member__name(member, cu);
+		const char *name = class_member__name(member);
 
 		if (name)
 			printed += fprintf(fp, "\n%.*s\t.%s = ", indent, tabs, name);
@@ -1563,7 +1971,7 @@ static int __class__fprintf_value(struct tag *tag, struct cu *cu, void *instance
 			if (!name)
 				continue;
 		} else {
-			printed += tag__fprintf_hexdump_value(member_type, cu, member_contents, member->byte_size, fp);
+			printed += instance__fprintf_hexdump_value(member_contents, member->byte_size, fp);
 		}
 
 		fputc(',', fp);
@@ -1585,7 +1993,7 @@ static int tag__fprintf_value(struct tag *type, struct cu *cu, void *instance, i
 	if (tag__is_struct(type))
 		return class__fprintf_value(type, cu, instance, _sizeof, 0, fp);
 
-	return tag__fprintf_hexdump_value(type, cu, instance, _sizeof, fp);
+	return instance__fprintf_hexdump_value(instance, _sizeof, fp);
 }
 
 static int pipe_seek(FILE *fp, off_t offset)
@@ -1596,7 +2004,7 @@ static int pipe_seek(FILE *fp, off_t offset)
 	if (chunk > offset)
 		chunk = offset;
 
-	while (fread(bf, chunk, 1, stdin) == 1) {
+	while (fread(bf, chunk, 1, fp) == 1) {
 		offset -= chunk;
 		if (offset == 0)
 			return 0;
@@ -1607,7 +2015,7 @@ static int pipe_seek(FILE *fp, off_t offset)
 	return offset == 0 ? 0 : -1;
 }
 
-static uint64_t tag__real_sizeof(struct tag *tag, struct cu *cu, int _sizeof, void *instance)
+static uint64_t tag__real_sizeof(struct tag *tag, int _sizeof, void *instance)
 {
 	if (tag__is_struct(tag)) {
 		struct type *type = tag__type(tag);
@@ -1658,8 +2066,7 @@ static struct tag *tag__real_type(struct tag *tag, struct cu **cup, void *instan
 		if (!list_empty(&type->type_enum) && type->type_member) {
 			struct class_member *member = type->type_member;
 			uint64_t value = base_type__value(instance + member->byte_offset, member->byte_size);
-			struct cu *cu_enumerator;
-			struct enumerator *enumerator = enumerations__lookup_entry_from_value(&type->type_enum, &cu_enumerator, value);
+			struct enumerator *enumerator = enumerations__lookup_entry_from_value(&type->type_enum, value);
 			char name[1024];
 
 			if (!enumerator)
@@ -1670,7 +2077,7 @@ static struct tag *tag__real_type(struct tag *tag, struct cu **cup, void *instan
 				return enumerator->type_enum.tag;
 			}
 
-			snprintf(name, sizeof(name), "%s", enumerator__name(enumerator, cu_enumerator));
+			snprintf(name, sizeof(name), "%s", enumerator__name(enumerator));
 			strlwr(name);
 
 			struct tag *real_type = cu__find_type_by_name(*cup, name, false, NULL);
@@ -1723,7 +2130,7 @@ static void type_instance__delete(struct type_instance *instance)
 static int64_t type_instance__int_value(struct type_instance *instance, const char *member_name_orig)
 {
 	struct cu *cu = instance->cu;
-	struct class_member *member = type__find_member_by_name(instance->type, cu, member_name_orig);
+	struct class_member *member = type__find_member_by_name(instance->type, member_name_orig);
 	int byte_offset = 0;
 
 	if (!member) {
@@ -1744,7 +2151,7 @@ static int64_t type_instance__int_value(struct type_instance *instance, const ch
 		*sep = 0;
 
 		while (1) {
-			member = type__find_member_by_name(type, cu, member_name);
+			member = type__find_member_by_name(type, member_name);
 			if (!member) {
 out_free_member_name:
 				free(member_name_alloc);
@@ -1761,7 +2168,7 @@ out_free_member_name:
 
 		}
 
-		member = type__find_member_by_name(type, cu, member_name);
+		member = type__find_member_by_name(type, member_name);
 		free(member_name_alloc);
 		if (member == NULL)
 			return -1;
@@ -1784,7 +2191,7 @@ static int64_t type__instance_read_once(struct type_instance *instance, FILE *fp
 
  	instance->read_already = true;
 
-	return fread(instance->instance, instance->type->size, 1, stdin) != 1 ? -1 : instance->type->size;
+	return fread(instance->instance, instance->type->size, 1, fp) != 1 ? -1 : (int64_t)instance->type->size;
 }
 
 /*
@@ -1813,7 +2220,7 @@ struct prototype {
 
 };
 
-static int prototype__stdio_fprintf_value(struct prototype *prototype, struct type_instance *header, FILE *fp)
+static int prototype__stdio_fprintf_value(struct prototype *prototype, struct type_instance *header, FILE *input, FILE *output)
 {
 	struct tag *type = prototype->class;
 	struct cu *cu = prototype->cu;
@@ -1827,9 +2234,9 @@ static int prototype__stdio_fprintf_value(struct prototype *prototype, struct ty
 	if (instance == NULL)
 		return -ENOMEM;
 
-	if (type__instance_read_once(header, stdin) < 0) {
+	if (type__instance_read_once(header, input) < 0) {
 		int err = --errno;
-		fprintf(stderr, "pahole: --header (%s) type not be read\n", conf.header_type);
+		fprintf(stderr, "pahole: --header (%s) type couldn't be read\n", conf.header_type);
 		return err;
 	}
 
@@ -1865,17 +2272,18 @@ static int prototype__stdio_fprintf_value(struct prototype *prototype, struct ty
 
 		free(member_name);
 
-		off_t total_read_bytes = ftell(stdin);
+		off_t total_read_bytes = ftell(input);
 
-		// Since we're reading stdin, we need to account for what we already read
+		// Since we're reading input, we need to account for what we already read
+		// FIXME: we now have a FILE pointer that _may_ be stdin, but not necessarily
 		if (seek_bytes < total_read_bytes) {
-			fprintf(stderr, "pahole: can't go back in stdin, already read %" PRIu64 " bytes, can't go to position %#" PRIx64 "\n",
+			fprintf(stderr, "pahole: can't go back in input, already read %" PRIu64 " bytes, can't go to position %#" PRIx64 "\n",
 					total_read_bytes, seek_bytes);
 			return -ENOMEM;
 		}
 
 		if (global_verbose) {
-			fprintf(fp, "pahole: range.seek_bytes evaluated from range=%s is %#" PRIx64 " \n",
+			fprintf(output, "pahole: range.seek_bytes evaluated from range=%s is %#" PRIx64 " \n",
 				range, seek_bytes);
 		}
 
@@ -1897,13 +2305,13 @@ static int prototype__stdio_fprintf_value(struct prototype *prototype, struct ty
 
 		size_bytes = value;
 		if (global_verbose) {
-			fprintf(fp, "pahole: range.size_bytes evaluated from range=%s is %#" PRIx64 " \n",
+			fprintf(output, "pahole: range.size_bytes evaluated from range=%s is %#" PRIx64 " \n",
 				range, size_bytes);
 		}
 
 		free(member_name);
 
-		if (pipe_seek(stdin, seek_bytes) < 0) {
+		if (pipe_seek(input, seek_bytes) < 0) {
 			int err = --errno;
 			fprintf(stderr, "Couldn't --seek_bytes %s (%" PRIu64 "\n", conf.seek_bytes, seek_bytes);
 			return err;
@@ -1947,11 +2355,11 @@ static int prototype__stdio_fprintf_value(struct prototype *prototype, struct ty
 
 
 		if (header) {
-			// Since we're reading stdin, we need to account for already read header:
-			seek_bytes -= ftell(stdin);
+			// Since we're reading input, we need to account for already read header:
+			seek_bytes -= ftell(input);
 		}
 
-		if (pipe_seek(stdin, seek_bytes) < 0) {
+		if (pipe_seek(input, seek_bytes) < 0) {
 			int err = --errno;
 			fprintf(stderr, "Couldn't --seek_bytes %s (%" PRIu64 "\n", conf.seek_bytes, seek_bytes);
 			return err;
@@ -1986,11 +2394,11 @@ static int prototype__stdio_fprintf_value(struct prototype *prototype, struct ty
 do_read:
 {
 	uint64_t read_bytes = 0;
-	off_t record_offset = ftell(stdin);
+	off_t record_offset = ftell(input);
 
-	while (fread(instance, _sizeof, 1, stdin) == 1) {
+	while (fread(instance, _sizeof, 1, input) == 1) {
 		// Read it from each record/instance
-		int real_sizeof = tag__real_sizeof(type, cu, _sizeof, instance);
+		int real_sizeof = tag__real_sizeof(type, _sizeof, instance);
 
 		if (real_sizeof > _sizeof) {
 			if (real_sizeof > max_sizeof) {
@@ -2003,7 +2411,7 @@ do_read:
 				instance = new_instance;
 				max_sizeof = real_sizeof;
 			}
-			if (fread(instance + _sizeof, real_sizeof - _sizeof, 1, stdin) != 1) {
+			if (fread(instance + _sizeof, real_sizeof - _sizeof, 1, input) != 1) {
 				fprintf(stderr, "Couldn't read record: %d bytes\n", real_sizeof);
 				printed = -1;
 				goto out;
@@ -2070,14 +2478,14 @@ do_read:
 			real_type = type;
 
 		if (global_verbose) {
-			printed += fprintf(fp, "// type=%s, offset=%#" PRIx64 ", sizeof=%d", type__name(tag__type(type), cu), record_offset, _sizeof);
+			printed += fprintf(output, "// type=%s, offset=%#" PRIx64 ", sizeof=%d", type__name(tag__type(type)), record_offset, _sizeof);
 			if (real_sizeof != _sizeof)
-				printed += fprintf(fp, ", real_sizeof=%d\n", real_sizeof);
+				printed += fprintf(output, ", real_sizeof=%d\n", real_sizeof);
 			else
-				printed += fprintf(fp, "\n");
+				printed += fprintf(output, "\n");
 		}
-		printed += tag__fprintf_value(real_type, real_type_cu, instance, real_sizeof, fp);
-		printed += fprintf(fp, ",\n");
+		printed += tag__fprintf_value(real_type, real_type_cu, instance, real_sizeof, output);
+		printed += fprintf(output, ",\n");
 
 		if (conf.count && ++count == conf.count)
 			break;
@@ -2085,7 +2493,7 @@ next_record:
 		if (read_bytes >= size_bytes)
 			break;
 
-		record_offset = ftell(stdin);
+		record_offset = ftell(input);
 	}
 }
 out:
@@ -2093,7 +2501,7 @@ out:
 	return printed;
 }
 
-static int class_member_filter__parse(struct class_member_filter *filter, struct type *type, struct cu *cu, char *sfilter)
+static int class_member_filter__parse(struct class_member_filter *filter, struct type *type, char *sfilter)
 {
 	const char *member_name = sfilter;
 	char *sep = strstr(sfilter, "==");
@@ -2116,11 +2524,11 @@ static int class_member_filter__parse(struct class_member_filter *filter, struct
 	char before = s[1];
 	s[1] = '\0';
 
-	filter->left = type__find_member_by_name(type, cu, member_name);
+	filter->left = type__find_member_by_name(type, member_name);
 
 	if (!filter->left) {
 		if (global_verbose)
-			fprintf(stderr, "The '%s' member wasn't found in '%s'\n", member_name, type__name(type, cu));
+			fprintf(stderr, "The '%s' member wasn't found in '%s'\n", member_name, type__name(type));
 		s[1] = before;
 		return -1;
 	}
@@ -2130,7 +2538,7 @@ static int class_member_filter__parse(struct class_member_filter *filter, struct
 	while (isspace(*value))
 		if (*++value == '\0') {
 			if (global_verbose)
-				fprintf(stderr, "The '%s' member was asked without a value to filter '%s'\n", member_name, type__name(type, cu));
+				fprintf(stderr, "The '%s' member was asked without a value to filter '%s'\n", member_name, type__name(type));
 			return -1; // no value
 		}
 
@@ -2155,7 +2563,7 @@ static int class_member_filter__parse(struct class_member_filter *filter, struct
 	if (enumerator_value < 0) {
 		if (global_verbose)
 			fprintf(stderr, "Couldn't resolve right operand ('%s') in '%s' with the specified 'type=%s' and type_enum' \n",
-				value, sfilter, class_member__name(type->type_member, cu));
+				value, sfilter, class_member__name(type->type_member));
 		return -1;
 	}
 
@@ -2164,11 +2572,11 @@ static int class_member_filter__parse(struct class_member_filter *filter, struct
 	return 0;
 }
 
-static struct class_member_filter *class_member_filter__new(struct type *type, struct cu *cu, char *sfilter)
+static struct class_member_filter *class_member_filter__new(struct type *type, char *sfilter)
 {
 	struct class_member_filter *filter = malloc(sizeof(*filter));
 
-	if (filter && class_member_filter__parse(filter, type, cu, sfilter)) {
+	if (filter && class_member_filter__parse(filter, type, sfilter)) {
 		free(filter);
 		filter = NULL;
 	}
@@ -2391,32 +2799,64 @@ out:
 static struct type_instance *header;
 
 static enum load_steal_kind pahole_stealer(struct cu *cu,
-					   struct conf_load *conf_load __unused)
+					   struct conf_load *conf_load)
 {
 	int ret = LSK__DELETE;
 
 	if (!cu__filter(cu))
 		goto filter_it;
 
+	if (conf_load->ptr_table_stats) {
+		static bool first = true;
+
+		if (first) {
+			cus__fprintf_ptr_table_stats_csv_header(stderr);
+			first = false;
+		}
+		cu__fprintf_ptr_table_stats_csv(cu, stderr);
+	}
+
 	if (btf_encode) {
-		if (cu__encode_btf(cu, global_verbose, btf_encode_force,
-				   skip_encoding_btf_vars)) {
+		static pthread_mutex_t btf_lock = PTHREAD_MUTEX_INITIALIZER;
+
+		pthread_mutex_lock(&btf_lock);
+		/*
+		 * FIXME:
+		 *
+		 * This should be really done at main(), but since in the current codebase only at this
+		 * point we'll have cu->elf setup...
+		 */
+		if (!btf_encoder) {
+			btf_encoder = btf_encoder__new(cu, detached_btf_filename, conf_load->base_btf, skip_encoding_btf_vars,
+						       btf_encode_force, btf_gen_floats, global_verbose);
+			if (btf_encoder == NULL) {
+				ret = LSK__STOP_LOADING;
+				goto out_btf;
+			}
+		}
+
+		if (btf_encoder__encode_cu(btf_encoder, cu)) {
 			fprintf(stderr, "Encountered error while encoding BTF.\n");
 			exit(1);
 		}
-		return LSK__DELETE;
+		ret = LSK__DELETE;
+out_btf:
+		pthread_mutex_unlock(&btf_lock);
+		return ret;
 	}
-
+#if 0
 	if (ctf_encode) {
 		cu__encode_ctf(cu, global_verbose);
 		/*
 		 * We still have to get the type signature code merged to eliminate
 		 * dups, reference another CTF file, etc, so for now just encode the
 		 * first cu that is let thru by cu__filter.
+		 *
+		 * FIXME: Disabled, should use Oracle's libctf
 		 */
 		goto dump_and_stop;
 	}
-
+#endif
 	if (class_name == NULL) {
 		if (stats_formatter == nr_methods_formatter) {
 			cu__account_nr_methods(cu);
@@ -2427,6 +2867,10 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 			cu_fixup_word_size_iterator(cu);
 
 		print_classes(cu);
+
+		if (sort_output && formatter == class_formatter)
+			ret = LSK__KEEPIT;
+
 		goto dump_it;
 	}
 
@@ -2451,8 +2895,13 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 		static type_id_t class_id;
 		struct tag *class = cu__find_type_by_name(cu, prototype->name, include_decls, &class_id);
 
-		if (class == NULL)
-			return ret; // couldn't find that class name in this CU, continue to the next one.
+		// couldn't find that class name in this CU, continue to the next one.
+		if (class == NULL) {
+			if (conf_load->skip_missing)
+				continue;
+			else
+				return ret;
+		}
 
 		if (prototype->nr_args != 0 && !tag__is_struct(class)) {
 			fprintf(stderr, "pahole: attributes are only supported with 'class' and 'struct' types\n");
@@ -2462,7 +2911,7 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 		struct type *type = tag__type(class);
 
 		if (prototype->size) {
-			type->sizeof_member = type__find_member_by_name(type, cu, prototype->size);
+			type->sizeof_member = type__find_member_by_name(type, prototype->size);
 			if (type->sizeof_member == NULL) {
 				fprintf(stderr, "pahole: the sizeof member '%s' wasn't found in the '%s' type\n",
 					prototype->size, prototype->name);
@@ -2471,7 +2920,7 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 		}
 
 		if (prototype->type) {
-			type->type_member = type__find_member_by_name(type, cu, prototype->type);
+			type->type_member = type__find_member_by_name(type, prototype->type);
 			if (type->type_member == NULL) {
 				fprintf(stderr, "pahole: the type member '%s' wasn't found in the '%s' type\n",
 					prototype->type, prototype->name);
@@ -2484,7 +2933,7 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 		}
 
 		if (prototype->filter) {
-			type->filter = class_member_filter__new(type, cu, prototype->filter);
+			type->filter = class_member_filter__new(type, prototype->filter);
 			if (type->filter == NULL) {
 				fprintf(stderr, "pahole: invalid filter '%s' for '%s'\n",
 					prototype->filter, prototype->name);
@@ -2498,7 +2947,7 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 			class_id = 0;
 		}
 
-		if (!isatty(0)) {
+		if (prettify_input) {
 			prototype->class = class;
 			prototype->cu	 = cu;
 			continue;
@@ -2534,10 +2983,13 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 		}
 	}
 
-	// If we got here with pretty printing is because we have everything solved except for type_enum
+	// If we got here with pretty printing is because we have everything solved except for type_enum or --header
 
-	if (!isatty(0)) {
-		// Check if we need to continue loading CUs to get those type_enum= resolved
+	if (prettify_input) {
+		// Check if we need to continue loading CUs to get those type_enum= and --header resolved
+		if (header == NULL && conf.header_type)
+			return LSK__KEEPIT;
+
 		list_for_each_entry(prototype, &class_names, node) {
 			if (prototype->type_enum && !prototype->type_enum_resolved)
 				return LSK__KEEPIT;
@@ -2546,7 +2998,7 @@ static enum load_steal_kind pahole_stealer(struct cu *cu,
 		// All set, pretty print it!
 		list_for_each_entry_safe(prototype, n, &class_names, node) {
 			list_del_init(&prototype->node);
-			if (prototype__stdio_fprintf_value(prototype, header, stdout) < 0)
+			if (prototype__stdio_fprintf_value(prototype, header, prettify_input, stdout) < 0)
 				break;
 		}
 
@@ -2583,6 +3035,9 @@ static void prototypes__delete(struct list_head *prototypes)
 {
 	struct prototype *prototype, *n;
 
+	if (prototypes == NULL)
+		return;
+
 	list_for_each_entry_safe(prototype, n, prototypes, node) {
 		list_del_init(&prototype->node);
 		prototype__delete(prototype);
@@ -2605,7 +3060,7 @@ static int prototypes__load(struct list_head *prototypes, const char *filename)
 		if (len == 0)
 			continue;
 		entry[len - 1] = '\0';
-		if (prototypes__add(&class_names, entry))
+		if (prototypes__add(prototypes, entry))
 			goto out;
 	}
 
@@ -2689,12 +3144,14 @@ int main(int argc, char *argv[])
 {
 	int err, remaining, rc = EXIT_FAILURE;
 
-	if (!isatty(0))
-		conf.hex_fmt = 0;
-
 	if (argp_parse(&pahole__argp, argc, argv, 0, &remaining, NULL)) {
 		argp_help(&pahole__argp, stderr, ARGP_HELP_SEE, argv[0]);
 		goto out;
+	}
+
+	if (class_name != NULL && stats_formatter == nr_methods_formatter) {
+		fputs("pahole: -m/nr_methods doesn't work with --class/-C, it shows all classes and the number of its methods\n", stderr);
+		return rc;
 	}
 
 	if (print_numeric_version) {
@@ -2702,16 +3159,36 @@ int main(int argc, char *argv[])
 		return 0;
 	}
 
-	if (dwarves__init(cacheline_size)) {
+	if (conf_load.hashtable_bits > 31) {
+		fprintf(stderr, "Invalid --hashbits value (%d) should be less than 32\n", conf_load.hashtable_bits);
+		goto out;
+	}
+
+	if (dwarves__init()) {
 		fputs("pahole: insufficient memory\n", stderr);
 		goto out;
 	}
 
+	dwarves__resolve_cacheline_size(&conf_load, cacheline_size);
+
+	if (prettify_input_filename) {
+		if (strcmp(prettify_input_filename, "-") == 0) {
+			prettify_input = stdin;
+		} else {
+			prettify_input = fopen(prettify_input_filename, "r");
+			if (prettify_input == NULL) {
+				fprintf(stderr, "Failed to read input '%s': %s\n",
+					prettify_input_filename, strerror(errno));
+				goto out_dwarves_exit;
+			}
+		}
+	}
+
 	if (base_btf_file) {
-		base_btf = btf__parse(base_btf_file, NULL);
-		if (libbpf_get_error(base_btf)) {
+		conf_load.base_btf = btf__parse(base_btf_file, NULL);
+		if (libbpf_get_error(conf_load.base_btf)) {
 			fprintf(stderr, "Failed to parse base BTF '%s': %ld\n",
-				base_btf_file, libbpf_get_error(base_btf));
+				base_btf_file, libbpf_get_error(conf_load.base_btf));
 			goto out;
 		}
 		if (!btf_encode && !ctf_encode) {
@@ -2731,7 +3208,7 @@ int main(int argc, char *argv[])
 	conf_load.steal = pahole_stealer;
 
 	// Make 'pahole --header type < file' a shorter form of 'pahole -C type --count 1 < file'
-	if (conf.header_type && !class_name && !isatty(0)) {
+	if (conf.header_type && !class_name && prettify_input) {
 		conf.count = 1;
 		class_name = conf.header_type;
 		conf.header_type = 0; // so that we don't read it and then try to read the -C type
@@ -2748,10 +3225,10 @@ try_sole_arg_as_class_names:
 		    strstarts(filename, "/sys/kernel/btf/") &&
 		    strstr(filename, "/vmlinux") == NULL) {
 			base_btf_file = "/sys/kernel/btf/vmlinux";
-			base_btf = btf__parse(base_btf_file, NULL);
-			if (libbpf_get_error(base_btf)) {
+			conf_load.base_btf = btf__parse(base_btf_file, NULL);
+			if (libbpf_get_error(conf_load.base_btf)) {
 				fprintf(stderr, "Failed to parse base BTF '%s': %ld\n",
-					base_btf_file, libbpf_get_error(base_btf));
+					base_btf_file, libbpf_get_error(conf_load.base_btf));
 				goto out;
 			}
 		}
@@ -2771,6 +3248,11 @@ try_sole_arg_as_class_names:
 		}
 		cus__fprintf_load_files_err(cus, "pahole", argv + remaining, err, stderr);
 		goto out_cus_delete;
+	}
+
+	if (sort_output && formatter == class_formatter) {
+		print_ordered_classes();
+		goto out_ok;
 	}
 
 	if (!list_empty(&class_names)) {
@@ -2811,23 +3293,29 @@ try_sole_arg_as_class_names:
 	header = NULL;
 
 	if (btf_encode) {
-		err = btf_encoder__encode();
+		err = btf_encoder__encode(btf_encoder);
 		if (err) {
 			fputs("Failed to encode BTF\n", stderr);
 			goto out_cus_delete;
 		}
 	}
-
+out_ok:
 	if (stats_formatter != NULL)
 		print_stats();
+
 	rc = EXIT_SUCCESS;
 out_cus_delete:
 #ifdef DEBUG_CHECK_LEAKS
 	cus__delete(cus);
 	structures__delete();
-	btf__free(base_btf);
+	btf__free(conf_load.base_btf);
+	conf_load.base_btf = NULL;
 #endif
 out_dwarves_exit:
+	if (prettify_input && prettify_input != stdin) {
+		fclose(prettify_input);
+		prettify_input = NULL;
+	}
 #ifdef DEBUG_CHECK_LEAKS
 	dwarves__exit();
 #endif

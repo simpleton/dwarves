@@ -13,12 +13,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-void *zalloc(const size_t size)
+void *zalloc(size_t size)
 {
-	void *s = malloc(size);
-	if (s != NULL)
-		memset(s, 0, size);
-	return s;
+        return calloc(1, size);
+}
+
+void __zfree(void **ptr)
+{
+        free(*ptr);
+        *ptr = NULL;
 }
 
 struct str_node *str_node__new(const char *s, bool dupstr)
@@ -43,8 +46,11 @@ out_delete:
 
 static void str_node__delete(struct str_node *snode, bool dupstr)
 {
+	if (snode == NULL)
+		return;
+
 	if (dupstr)
-		free((void *)snode->s);
+		zfree(&snode->s);
 	free(snode);
 }
 
@@ -174,17 +180,22 @@ bool strlist__has_entry(struct strlist *slist, const char *entry)
 	return false;
 }
 
-Elf_Scn *elf_section_by_name(Elf *elf, GElf_Ehdr *ep,
-			     GElf_Shdr *shp, const char *name, size_t *index)
+Elf_Scn *elf_section_by_name(Elf *elf, GElf_Shdr *shp, const char *name, size_t *index)
 {
 	Elf_Scn *sec = NULL;
 	size_t cnt = 1;
+	size_t str_idx;
+
+	if (elf_getshdrstrndx(elf, &str_idx))
+		return NULL;
 
 	while ((sec = elf_nextscn(elf, sec)) != NULL) {
 		char *str;
 
 		gelf_getshdr(sec, shp);
-		str = elf_strptr(elf, ep->e_shstrndx, shp->sh_name);
+		str = elf_strptr(elf, str_idx, shp->sh_name);
+		if (!str)
+			return NULL;
 		if (!strcmp(name, str)) {
 			if (index)
 				*index = cnt;

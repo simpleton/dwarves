@@ -106,7 +106,7 @@ static void refcnt_function(struct function *function, const struct cu *cu)
 	refcnt_lexblock(&function->lexblock, cu);
 }
 
-static int cu_refcnt_iterator(struct cu *cu, void *cookie __unused)
+static int cu_refcnt_iterator(struct cu *cu, void *cookie __maybe_unused)
 {
 	struct function *pos;
 	uint32_t id;
@@ -117,7 +117,7 @@ static int cu_refcnt_iterator(struct cu *cu, void *cookie __unused)
 }
 
 static int lost_iterator(struct tag *tag, struct cu *cu,
-			 void *cookie __unused)
+			 void *cookie __maybe_unused)
 {
 	if (!tag->visited && tag__decl_file(tag, cu)) {
 		tag__fprintf(tag, cu, NULL, stdout);
@@ -131,15 +131,17 @@ static int cu_lost_iterator(struct cu *cu, void *cookie)
 	return cu__for_all_tags(cu, lost_iterator, cookie);
 }
 
-int main(int argc __unused, char *argv[])
+int main(int argc __maybe_unused, char *argv[])
 {
 	int err;
 	struct cus *cus = cus__new();
 
-	if (dwarves__init(0) || cus == NULL) {
+	if (dwarves__init() || cus == NULL) {
 		fputs("prefcnt: insufficient memory\n", stderr);
 		return EXIT_FAILURE;
 	}
+
+	dwarves__resolve_cacheline_size(NULL, 0);
 
 	err = cus__load_files(cus, NULL, argv + 1);
 	if (err != 0) {

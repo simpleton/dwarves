@@ -25,8 +25,7 @@ static void emit_tag(struct tag *tag, uint32_t tag_id, struct cu *cu)
 
 	if (tag->tag == DW_TAG_base_type) {
 		char bf[64];
-		const char *name = base_type__name(tag__base_type(tag), cu,
-						   bf, sizeof(bf));
+		const char *name = base_type__name(tag__base_type(tag), bf, sizeof(bf));
 
 		if (name == NULL)
 			printf("anonymous base_type\n");
@@ -73,7 +72,7 @@ static int cu__emit_tags(struct cu *cu)
 }
 
 static enum load_steal_kind pdwtags_stealer(struct cu *cu,
-					    struct conf_load *conf_load __unused)
+					    struct conf_load *conf_load __maybe_unused)
 {
 	cu__emit_tags(cu);
 	return LSK__DELETE;
@@ -104,7 +103,7 @@ static const struct argp_option pdwtags__options[] = {
 	}
 };
 
-static error_t pdwtags__options_parser(int key, char *arg __unused,
+static error_t pdwtags__options_parser(int key, char *arg __maybe_unused,
 				      struct argp_state *state)
 {
 	switch (key) {
@@ -132,10 +131,12 @@ int main(int argc, char *argv[])
 	int remaining, rc = EXIT_FAILURE, err;
 	struct cus *cus = cus__new();
 
-	if (dwarves__init(0) || cus == NULL) {
+	if (dwarves__init() || cus == NULL) {
 		fputs("pwdtags: insufficient memory\n", stderr);
 		goto out;
 	}
+
+	dwarves__resolve_cacheline_size(&pdwtags_conf_load, 0);
 
 	if (argp_parse(&pdwtags__argp, argc, argv, 0, &remaining, NULL) ||
 	    remaining == argc) {

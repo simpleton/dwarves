@@ -21,7 +21,7 @@ It also uses these structure layouts to pretty print data feed to its standard
 input, e.g.:
 .PP
 .nf
-$ pahole --header elf64_hdr < /lib/modules/5.8.0-rc6+/build/vmlinux
+$ pahole --header elf64_hdr --prettify /lib/modules/5.8.0-rc6+/build/vmlinux
 {
 	.e_ident = { 127, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
 	.e_type = 2,
@@ -101,6 +101,15 @@ or file URLs (e.g.: file://class_list.txt)
 Set cacheline size to SIZE bytes.
 
 .TP
+.B \-\-sort
+Sort the output by type name, maybe this will grow to allow sorting by other
+criteria.
+
+This is mostly needed so that pretty printing from BTF and DWARF can be
+comparable when using using multiple threads to load DWARF data, when the order
+that the types in the compile units is processed is not deterministic.
+
+.TP
 .B \-\-count=COUNT
 Pretty print the first COUNT records from input.
 
@@ -118,6 +127,13 @@ offset from the beginning of a struct is.
 Allows specifying a list of debugging formats to try, in order. Right now this
 includes "ctf" and "dwarf". The default format path used is equivalent to
 "-F dwarf,ctf".
+
+.TP
+.B \-\-hashbits=BITS
+Allows specifying the number of bits for the debugging format loader to use.
+The only one affected so far is the "dwarf" one, its default now is 15, the
+maximum for it is now 21 bits. Tweak it to see if it improves performance as
+the kernel evolves and more types and functions have to be loaded.
 
 .TP
 .B \-\-hex
@@ -182,12 +198,29 @@ the debugging information.
 Do not encode VARs in BTF.
 
 .TP
+.B \-\-skip_encoding_btf_decl_tag
+Do not encode decl tags in BTF.
+
+.TP
+.B \-\-skip_encoding_btf_type_tag
+Do not encode type tags in BTF.
+
+.TP
+.B \-j, \-\-jobs=N
+Run N jobs in parallel. Defaults to number of online processors + 10% (like
+the 'ninja' build system) if no argument is specified.
+
+.TP
 .B \-J, \-\-btf_encode
 Encode BTF information from DWARF, used in the Linux kernel build process when
 CONFIG_DEBUG_INFO_BTF=y is present, introduced in Linux v5.2. Used to implement
 features such as BPF CO-RE (Compile Once - Run Everywhere).
 
 See \fIhttps://nakryiko.com/posts/bpf-portability-and-co-re/\fR.
+
+.TP
+.B \-\-btf_encode_detached=FILENAME
+Same thing as -J/--btf_encode, but storing the raw BTF info into a separate file.
 
 .TP
 .B \-\-btf_encode_force
@@ -200,12 +233,30 @@ This may be inferred when asking for a /sys/kernel/btf/MODULE, when it will be a
 to "/sys/kernel/btf/vmlinux".
 
 .TP
+.B \-\-btf_gen_floats
+Allow producing BTF_KIND_FLOAT entries in systems where the vmlinux DWARF
+information has float types.
+
+.TP
+.B \-\-btf_gen_all
+Allow using all the BTF features supported by pahole.
+
+.TP
 .B \-l, \-\-show_first_biggest_size_base_type_member
 Show first biggest size base_type member.
 
 .TP
 .B \-m, \-\-nr_methods
-Show number of methods.
+Show number of methods of all classes, i.e. the number of functions have arguments that
+are pointers to a given class.
+
+To get the number of methods for an specific class, please use:
+
+  $ pahole --nr_methods | grep -w sock
+  sock  1005
+  $ 
+
+In the above example it used the BTF information in /sys/kernel/btf/vmlinux.
 
 .TP
 .B \-M, \-\-show_only_data_members
@@ -228,6 +279,10 @@ Show tag with DWARF OFFSET.
 .B \-P, \-\-packable
 Show only structs that has holes that can be packed if members are reorganized,
 for instance when using the \fB\-\-reorganize\fR option.
+
+.TP
+.B \-P, \-\-with_flexible_array
+Show only structs that have a flexible array.
 
 .TP
 .B \-q, \-\-quiet
@@ -284,6 +339,12 @@ Converts silly bitfields such as "int foo:32" to plain "int foo".
 be verbose
 
 .TP
+.B \-\-ptr_table_stats
+Print statistics about ptr_table data structures, used to hold all the types,
+tags and functions data structures, for development tuning of such tables, tuned
+for a typical 2021 vmlinux file.
+
+.TP
 .B \-w, \-\-word_size=WORD_SIZE
 Change the arch word size to WORD_SIZE.
 
@@ -326,6 +387,10 @@ Show a traditional string version, i.e.: "v1.18".
 .B \-\-numeric_version
 Show a numeric only version, suitable for use in Makefiles and scripts where
 one wants to know what if the installed version has some feature, i.e.: 118 instead of "v1.18".
+
+.TP
+.B \-\-kabi_prefix=STRING
+When the prefix of the string is STRING, treat the string as STRING.
 
 .SH NOTES
 
@@ -537,6 +602,11 @@ $ pahole rcu_state | grep raw_spinlock_t -B1 -A5
 };
 $
 .fi
+
+.SH PRETTY PRINTING
+.P
+pahole can also use the data structure types to pretty print raw data specified via --prettify.
+To consume raw data from the standard input, just use '--prettify -'
 .P
 It can also pretty print raw data from stdin according to the type specified:
 .PP
@@ -554,7 +624,7 @@ $
 $ ls -la versions
 -rw-rw-r--. 1 acme acme 7616 Jun 25 11:33 versions
 $
-$ pahole --count 3 -C modversion_info drivers/scsi/sg.ko < versions
+$ pahole --count 3 -C modversion_info drivers/scsi/sg.ko --prettify versions
 {
       .crc = 0x8dabd84,
       .name = "module_layout",
@@ -568,7 +638,7 @@ $ pahole --count 3 -C modversion_info drivers/scsi/sg.ko < versions
       .name = "param_ops_int",
 },
 $
-$ pahole --skip 1 --count 2 -C modversion_info drivers/scsi/sg.ko < versions
+$ pahole --skip 1 --count 2 -C modversion_info drivers/scsi/sg.ko --prettify - < versions
 {
       .crc = 0x45e4617b,
       .name = "no_llseek",
@@ -580,7 +650,7 @@ $ pahole --skip 1 --count 2 -C modversion_info drivers/scsi/sg.ko < versions
 $
 This is equivalent to:
 
-$ pahole --seek_bytes 64 --count 1 -C modversion_info drivers/scsi/sg.ko < versions
+$ pahole --seek_bytes 64 --count 1 -C modversion_info drivers/scsi/sg.ko --prettify versions
 {
 	.crc = 0x45e4617b,
 	.name = "no_llseek",
@@ -588,11 +658,6 @@ $ pahole --seek_bytes 64 --count 1 -C modversion_info drivers/scsi/sg.ko < versi
 $
 .fi
 .P
-
-.SH PRETTY PRINTING
-.P
-pahole can also use the data structure types to pretty print raw data coming
-from its standard input.
 
 .TP
 .B \-C, \-\-class_name=CLASS_NAME
@@ -636,7 +701,7 @@ $
 Now we can use this to show the first record from offset zero:
 .PP
 .nf
-$ pahole -C elf64_hdr --count 1 < /lib/modules/5.8.0-rc3+/build/vmlinux
+$ pahole -C elf64_hdr --count 1 --prettify /lib/modules/5.8.0-rc3+/build/vmlinux
 {
 	.e_ident = { 127, 69, 76, 70, 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
 	.e_type = 2,
@@ -659,7 +724,7 @@ $
 This is equivalent to:
 .PP
 .nf
-$ pahole --header elf64_hdr < /lib/modules/5.8.0-rc3+/build/vmlinux
+$ pahole --header elf64_hdr --prettify /lib/modules/5.8.0-rc3+/build/vmlinux
 .fi
 .P
 The --header option also allows reference in other command line options to fields in the header.
@@ -667,7 +732,7 @@ This is useful when one wants to show multiple records in a file and the range w
 are located is specified in header fields, such as for perf.data files:
 .PP
 .nf
-$ pahole --hex ~/bin/perf --header perf_file_header < perf.data
+$ pahole --hex ~/bin/perf --header perf_file_header --prettify perf.data
 {
 	.magic = 0x32454c4946524550,
 	.size = 0x68,
@@ -692,7 +757,7 @@ $
 So to display the cgroups records in the perf_file_header.data section we can use:
 .PP
 .nf
-$ pahole ~/bin/perf --header=perf_file_header --seek_bytes '$header.data.offset' --size_bytes='$header.data.size' -C 'perf_event_header(sizeof,type,type_enum=perf_event_type,filter=type==PERF_RECORD_CGROUP)' < perf.data
+$ pahole ~/bin/perf --header=perf_file_header --seek_bytes '$header.data.offset' --size_bytes='$header.data.size' -C 'perf_event_header(sizeof,type,type_enum=perf_event_type,filter=type==PERF_RECORD_CGROUP)' --prettify perf.data
 {
 	.header = {
 		.type = PERF_RECORD_CGROUP,
@@ -736,7 +801,7 @@ $ pahole ~/bin/perf --header=perf_file_header --seek_bytes '$header.data.offset'
 		.size = 88,
 	},
 	.id = 13,
-	.path = "/machine.slice/machine-qemu\x2d1\x2drhel6.sandy.scope",
+	.path = "/machine.slice/machine-qemu\\x2d1\\x2drhel6.sandy.scope",
 },
 $ 
 .fi
@@ -744,12 +809,12 @@ $
 For the common case of the header having a member that has the 'offset' and 'size' members, it is possible to use this more compact form:
 .PP
 .nf
-$ pahole ~/bin/perf --header=perf_file_header --range=data -C 'perf_event_header(sizeof,type,type_enum=perf_event_type,filter=type==PERF_RECORD_CGROUP)' < perf.data
+$ pahole ~/bin/perf --header=perf_file_header --range=data -C 'perf_event_header(sizeof,type,type_enum=perf_event_type,filter=type==PERF_RECORD_CGROUP)' --prettify perf.data
 .fi
 .P
 This uses ~/bin/perf to get the type definitions, the defines 'struct perf_file_header' as the header,
 then seeks '$header.data.offset' bytes from the start of the file, and considers '$header.data.size' bytes
-worth of such records. The filter expression may omit a common prefix, in this case it could additonally be
+worth of such records. The filter expression may omit a common prefix, in this case it could additionally be
 equivalently written as both 'filter=type==CGROUP' or the 'filter=' can also be omitted, getting as compact
 as 'type==CGROUP':
 .P
@@ -818,7 +883,7 @@ If we remove that type_enum=perf_event_type, we will lose the conversion of 'str
 more descriptive 'struct perf_record_cgroup', and also the beautification of the header.type field:
 .PP
 .nf
-$ pahole ~/bin/perf --header=perf_file_header --seek_bytes '$header.data.offset' --size_bytes='$header.data.size' -C 'perf_event_header(sizeof,type,filter=type==19)' < perf.data
+$ pahole ~/bin/perf --header=perf_file_header --seek_bytes '$header.data.offset' --size_bytes='$header.data.size' -C 'perf_event_header(sizeof,type,filter=type==19)' --prettify perf.data
 {
 	.type = 19,
 	.misc = 0,
@@ -850,7 +915,7 @@ $
 Some of the records are not found in 'type_enum=perf_event_type' so some of the records don't get converted to a type that fully shows its contents. For perf we know that those are in another enumeration, 'enum perf_user_event_type', so, for these cases, we can create a 'virtual enum', i.e. the sum of two enums and then get all those entries decoded and properly casted, first few records with just 'enum perf_event_type':
 .PP
 .nf
-$ pahole ~/bin/perf --header=perf_file_header --seek_bytes '$header.data.offset' --size_bytes='$header.data.size' -C 'perf_event_header(sizeof,type,type_enum=perf_event_type)' --count 4 < perf.data
+$ pahole ~/bin/perf --header=perf_file_header --seek_bytes '$header.data.offset' --size_bytes='$header.data.size' -C 'perf_event_header(sizeof,type,type_enum=perf_event_type)' --count 4 --prettify perf.data
 {
 	.type = 79,
 	.misc = 0,
@@ -881,7 +946,7 @@ $
 Now with both enumerations, i.e. with 'type_enum=perf_event_type+perf_user_event_type':
 .PP
 .nf
-$ pahole ~/bin/perf --header=perf_file_header --seek_bytes '$header.data.offset' --size_bytes='$header.data.size' -C 'perf_event_header(sizeof,type,type_enum=perf_event_type+perf_user_event_type)' --count 5 < perf.data
+$ pahole ~/bin/perf --header=perf_file_header --seek_bytes '$header.data.offset' --size_bytes='$header.data.size' -C 'perf_event_header(sizeof,type,type_enum=perf_event_type+perf_user_event_type)' --count 5 --prettify perf.data
 {
 	.header = {
 		.type = PERF_RECORD_TIME_CONV,
@@ -940,7 +1005,7 @@ data range with the following command:
 .PP
 .nf
 pahole ~/bin/perf --header=perf_file_header \
-         -C 'perf_file_attr(range=attrs),perf_event_header(range=data,sizeof,type,type_enum=perf_event_type+perf_user_event_type)' < perf.data
+         -C 'perf_file_attr(range=attrs),perf_event_header(range=data,sizeof,type,type_enum=perf_event_type+perf_user_event_type)' --prettify perf.data
 .fi
 
 .SH SEE ALSO
