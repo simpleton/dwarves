@@ -18,12 +18,13 @@ cc_defaults {
         "-DDWARVES_MAJOR_VERSION=1",
         "-DDWARVES_MINOR_VERSION=19",
         "-D_GNU_SOURCE",
+        "-Wno-constant-conversion",
         "-Wno-deprecated-declarations",
+        "-Wno-missing-field-initializers",
         "-Wno-pointer-arith",
         "-Wno-unused-parameter",
         "-Wno-unused-variable",
     ],
-    visibility: [":__subpackages__"],
     compile_multilib: "64",
 }
 
@@ -47,12 +48,12 @@ cc_library_host_static {
     ],
     whole_static_libs: [
         "libbpf",
-        "libdw",
-        "libelf",
+        // "libdw",
+        "dwarves_libdw",
+        "dwarves_libelf",
         "libz",
     ],
 }
-
 
 cc_binary_host {
     name: "pahole",

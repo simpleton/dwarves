@@ -37,9 +37,12 @@
  * using the generic single-entry routines.
  */
 
+#ifndef __LIST_HEAD
+#define __LIST_HEAD
 struct list_head {
 	struct list_head *next, *prev;
 };
+#endif
 
 #define LIST_HEAD_INIT(name) { &(name), &(name) }
 

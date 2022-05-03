@@ -1,0 +1,110 @@
+
+cc_defaults {
+    name: "dwarves_elfutils_defaults",
+    cflags: [
+        "-DHAVE_CONFIG_H",
+        "-D_GNU_SOURCE",
+        // upper bound for the number of lines of the resulting mnemonic files
+        "-DNMNES=1000",
+        "-std=gnu99",
+        "-Werror",
+        // to suppress the "pointer of type ‘void *’ used in arithmetic" warning
+        "-Wno-pointer-arith",
+        "-Wno-typedef-redefinition",
+        "-Wno-implicit-function-declaration",
+        "-Wno-error-int-conversion",
+        "-Wno-error-conditional-type-mismatch",
+    ],
+    header_libs: [
+         "dwarves_elfutils_headers",
+    ],
+    export_header_lib_headers: ["dwarves_elfutils_headers"],
+}
+
+cc_library_headers {
+    name: "dwarves_elfutils_headers",
+    host_supported: true,
+    vendor_available: true,
+    export_include_dirs: [
+        ".",
+        "include",
+        "lib",
+        "bionic-fixup",
+    ],
+}
+
+cc_library {
+    name: "dwarves_libelf",
+    host_supported: true,
+    vendor_available: true,
+    defaults: ["dwarves_elfutils_defaults"],
+    cflags:[
+      "-include AndroidFixup.h",
+    ],
+    srcs:  ["libelf/*.c",],
+
+    static_libs: ["libz"],
+
+    export_include_dirs: ["libelf"],
+}
+
+
+cc_library_host_static {
+    name: "dwarves_libdw",
+    defaults: ["dwarves_elfutils_defaults"],
+    srcs: [
+        "backends/*.c",
+        "libcpu/bpf_disasm.c",
+        "libcpu/riscv_disasm.c",
+        "libdw/*.c",
+        "libdwelf/*.c",
+        "libdwfl/*.c",
+        "libebl/*.c",
+    ],
+    /* generated_headers: [
+        "i386_dis",
+        "i386_mnemonics",
+        "x86_64_dis",
+        "x86_64_mnemonics",
+    ], */
+    exclude_srcs: [
+        // Do not enabled compression support
+        "libdwfl/bzip2.c",
+        "libdwfl/lzma.c",
+        "libdwfl/zstd.c",
+        // Those headers are incompatible with clang due to nested function
+        // definitions.
+        "libdwfl/dwfl_segment_report_module.c",
+        "libdwfl/debuginfod-client.c",
+        "libdwfl/elf-from-memory.c",
+        "libdwfl/link_map.c",
+        // These depend on argp which doesn't exist in musl
+        "libdwfl/argp-std.c",
+        // Those are common source files actually used as headers and not
+        // compiled standalone.
+        "backends/common-reloc.c",
+        "backends/linux-core-note.c",
+        "backends/x86_corenote.c",
+        // sim test
+        "backends/i386_init.c",
+        "backends/x86_64_init.c",
+    ],
+    local_include_dirs: [
+        "libcpu",
+        "libasm",
+        "libdwelf",
+        "libdwfl",
+        "libebl",
+    ],
+    export_include_dirs: [
+        "libdw",
+        "include",
+    ],
+    static_libs: [
+        "dwarves_libelf"
+    ],
+    whole_static_libs: [
+        "dwarves_libeu",
+    ],
+    compile_multilib: "64",
+}
